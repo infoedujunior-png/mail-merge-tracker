@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: mail-merge-tracker
+    env: node
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: GOOGLE_SERVICE_ACCOUNT_JSON
+        sync: false   # You will paste this in Render dashboard
+      - key: TRACKING_SHEET_ID
+        sync: false   # Your Google Sheet ID for tracking logs
+      - key: DASHBOARD_KEY
+        sync: false   # Password to view your dashboard
