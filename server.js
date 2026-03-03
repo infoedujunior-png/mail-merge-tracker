@@ -121,6 +121,73 @@ function toCol(n) {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
+// ── Update sheet using USER's OAuth token (for scheduled sends) ──
+async function updateSheetWithUserToken(token, sheetId, sheetTab, email, status) {
+  try {
+    const tab = sheetTab || 'Sheet1';
+    const res = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(tab+'!A1:Z500')}`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (!res.ok) { console.log(`Sheet read failed: ${res.status}`); return; }
+    const data = await res.json();
+    const rows = data.values || [];
+    if (rows.length < 2) return;
+
+    const headers  = rows[0].map(h => (h||'').toLowerCase().trim());
+    const emailCol = headers.findIndex(h => h.includes('email'));
+    const statCol  = headers.findIndex(h => h.includes('merge status') || h === 'status');
+    if (emailCol < 0 || statCol < 0) { console.log('Columns not found:', headers); return; }
+
+    let targetRow = -1;
+    for (let i = 1; i < rows.length; i++) {
+      if ((rows[i][emailCol]||'').toLowerCase().trim() === email.toLowerCase().trim()) {
+        targetRow = i + 1; break;
+      }
+    }
+    if (targetRow < 0) { console.log(`Email not found: ${email}`); return; }
+
+    const P = { EMAIL_SENT:1, EMAIL_OPENED:2, EMAIL_CLICKED:3, EMAIL_BOUNCED:4, UNSUBSCRIBED:5 };
+    const cur = ((rows[targetRow-1]||[])[statCol]||'').toUpperCase().trim();
+    if ((P[cur]||0) >= (P[status]||0)) return;
+
+    const col = toCol(statCol + 1);
+    await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(tab+'!'+col+targetRow)}?valueInputOption=USER_ENTERED`,
+      {
+        method: 'PUT',
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ values: [[status]] }),
+      }
+    );
+
+    // Apply color using service account
+    try {
+      const sheets = await getSheets();
+      const color = STATUS_COLORS[status];
+      if (color) {
+        let gid = 0;
+        try {
+          const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId, fields: 'sheets.properties' });
+          const sh = (meta.data.sheets||[]).find(s => s.properties.title === tab);
+          gid = sh?.properties?.sheetId ?? 0;
+        } catch(e) {}
+        await sheets.spreadsheets.batchUpdate({
+          spreadsheetId: sheetId,
+          requestBody: { requests: [{ repeatCell: {
+            range: { sheetId:gid, startRowIndex:targetRow-1, endRowIndex:targetRow, startColumnIndex:statCol, endColumnIndex:statCol+1 },
+            cell: { userEnteredFormat: { backgroundColor: color, textFormat: { bold: false } } },
+            fields: 'userEnteredFormat(backgroundColor,textFormat)',
+          }}]}
+        });
+      }
+    } catch(e) {}
+
+    console.log(`✅ Scheduled sheet updated: ${email} → ${status} row ${targetRow}`);
+  } catch(e) { console.error('updateSheetWithUserToken error:', e.message); }
+}
+
+
 // ── ROUTES ─────────────────────────────────────────────────
 
 app.get('/ping', (req,res) => res.json({ status:'alive', time:new Date() }));
@@ -190,10 +257,33 @@ app.post('/schedule', async (req,res) => {
       scheduleStore[id].status = 'running';
       let sent = 0;
 
+      const serverUrl = process.env.RENDER_EXTERNAL_URL || 'https://mail-merge-tracker.onrender.com';
+      const campaign  = encodeURIComponent((draftSubject||'scheduled') + '_' + Date.now());
+      const sid       = encodeURIComponent(sheetId||'');
+      const stab      = encodeURIComponent(sheetTab||'Sheet1');
+
       for (const r of recipients) {
         try {
           let html    = (draftHtml||'').replace(/\{\{(\w[\w\s]*)\}\}/g,(m,k)=>r[k.trim().toLowerCase()]||r[k.trim()]||m);
           let subject = (draftSubject||'').replace(/\{\{(\w[\w\s]*)\}\}/g,(m,k)=>r[k.trim().toLowerCase()]||r[k.trim()]||m);
+
+          const emailEnc = encodeURIComponent(r.email);
+
+          // Inject open tracking pixel
+          const pixel = `<img src="${serverUrl}/track/open?email=${emailEnc}&campaign=${campaign}&sheetId=${sid}&tab=${stab}" width="1" height="1" style="display:none" alt="" />`;
+          html = html.includes('</body>') ? html.replace('</body>', pixel+'</body>') : html + pixel;
+
+          // Wrap links for click tracking
+          html = html.replace(/href="(https?:\/\/[^"]+)"/gi, (m, orig) => {
+            if (orig.includes(serverUrl)) return m;
+            const wrapped = `${serverUrl}/track/click?email=${emailEnc}&campaign=${campaign}&sheetId=${sid}&tab=${stab}&url=${encodeURIComponent(orig)}`;
+            return `href="${wrapped}"`;
+          });
+
+          // Add unsubscribe footer
+          const unsubUrl = `${serverUrl}/unsubscribe?email=${emailEnc}&campaign=${campaign}&sheetId=${sid}&tab=${stab}`;
+          const footer = `<div style="margin-top:28px;padding-top:14px;border-top:1px solid #e8eaed;text-align:center;font-family:Arial,sans-serif;font-size:11px;color:#9aa0a6;"><a href="${unsubUrl}" style="color:#9aa0a6;text-decoration:underline;">Unsubscribe</a></div>`;
+          html = html.includes('</body>') ? html.replace('</body>', footer+'</body>') : html + footer;
 
           const boundary = 'mm_'+Math.random().toString(36).slice(2);
           const raw = [`From: ${sender}`,`To: ${r.email}`,`Subject: ${subject}`,`MIME-Version: 1.0`,`Content-Type: multipart/alternative; boundary="${boundary}"`,``,`--${boundary}`,`Content-Type: text/html; charset=UTF-8`,``,html,``,`--${boundary}--`].join('\r\n');
@@ -204,7 +294,12 @@ app.post('/schedule', async (req,res) => {
             headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},
             body: JSON.stringify({raw:encoded}),
           });
-          if (sr.ok) { sent++; if(sheetId) await updateStatus(sheetId, sheetTab, r.email, 'EMAIL_SENT'); }
+
+          if (sr.ok) {
+            sent++;
+            // Update sheet using user token for EMAIL_SENT
+            if (sheetId) await updateSheetWithUserToken(token, sheetId, sheetTab||'Sheet1', r.email, 'EMAIL_SENT');
+          }
         } catch(e) { console.error('Send error:', e.message); }
         await sleep(400);
       }
