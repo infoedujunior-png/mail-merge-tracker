@@ -47,8 +47,22 @@ async function updateStatus(sheetId, tab, email, newStatus) {
 
     const headers  = rows[0].map(h => (h||'').toLowerCase().trim());
     const emailCol = headers.findIndex(h => h.includes('email'));
-    const statCol  = headers.findIndex(h => h.includes('merge status') || h === 'status');
-    if (emailCol < 0 || statCol < 0) { console.log('❌ Columns not found:', headers); return; }
+    let   statCol  = headers.findIndex(h => h.includes('merge status') || h === 'status');
+    if (emailCol < 0) { console.log('❌ No email column:', headers); return; }
+
+    // ✅ Auto-create Merge Status column if missing
+    if (statCol < 0) {
+      console.log('⚠️ Creating Merge Status column...');
+      statCol = headers.length;
+      const newCol = toCol(statCol + 1);
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: sheetId,
+        range: `${sheetTab}!${newCol}1`,
+        valueInputOption: 'USER_ENTERED',
+        requestBody: { values: [['Merge Status']] },
+      });
+      console.log(`✅ Merge Status column created at ${newCol}1`);
+    }
 
     let targetRow = -1;
     for (let i = 1; i < rows.length; i++) {
@@ -136,8 +150,24 @@ async function updateSheetWithUserToken(token, sheetId, sheetTab, email, status)
 
     const headers  = rows[0].map(h => (h||'').toLowerCase().trim());
     const emailCol = headers.findIndex(h => h.includes('email'));
-    const statCol  = headers.findIndex(h => h.includes('merge status') || h === 'status');
-    if (emailCol < 0 || statCol < 0) { console.log('Columns not found:', headers); return; }
+    let   statCol  = headers.findIndex(h => h.includes('merge status') || h === 'status');
+
+    // ✅ AUTO-CREATE "Merge Status" column if missing!
+    if (emailCol < 0) { console.log('No email column found:', headers); return; }
+    if (statCol < 0) {
+      console.log('⚠️ Merge Status column missing — creating it...');
+      statCol = headers.length; // new column at end
+      const newColLetter = toCol(statCol + 1);
+      await fetch(
+        `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(tab+'!'+newColLetter+'1')}?valueInputOption=USER_ENTERED`,
+        {
+          method: 'PUT',
+          headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ values: [['Merge Status']] }),
+        }
+      );
+      console.log(`✅ Merge Status column created at ${newColLetter}1`);
+    }
 
     let targetRow = -1;
     for (let i = 1; i < rows.length; i++) {
@@ -253,60 +283,88 @@ app.post('/schedule', async (req,res) => {
     console.log(`📅 Job ${id} scheduled for ${scheduledAt} — ${recipients.length} emails`);
 
     setTimeout(async () => {
-      console.log(`🚀 Running job ${id}`);
+      console.log(`🚀 SCHEDULE RUNNING: Job ${id} | ${recipients.length} emails`);
       scheduleStore[id].status = 'running';
       let sent = 0;
 
-      const serverUrl = process.env.RENDER_EXTERNAL_URL || 'https://mail-merge-tracker.onrender.com';
+      const serverUrl = 'https://mail-merge-tracker.onrender.com';
       const campaign  = encodeURIComponent((draftSubject||'scheduled') + '_' + Date.now());
       const sid       = encodeURIComponent(sheetId||'');
       const stab      = encodeURIComponent(sheetTab||'Sheet1');
 
+      // ✅ Always wrap in full HTML so pixel/footer always inject correctly
+      function wrapHtml(rawHtml) {
+        if (!rawHtml.toLowerCase().includes('<html')) {
+          return `<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body>${rawHtml}</body></html>`;
+        }
+        if (!rawHtml.toLowerCase().includes('</body>')) {
+          return rawHtml + '</body></html>';
+        }
+        return rawHtml;
+      }
+
       for (const r of recipients) {
         try {
+          console.log(`📤 Sending to: ${r.email}`);
           let html    = (draftHtml||'').replace(/\{\{(\w[\w\s]*)\}\}/g,(m,k)=>r[k.trim().toLowerCase()]||r[k.trim()]||m);
           let subject = (draftSubject||'').replace(/\{\{(\w[\w\s]*)\}\}/g,(m,k)=>r[k.trim().toLowerCase()]||r[k.trim()]||m);
 
+          // Wrap in full HTML structure first
+          html = wrapHtml(html);
+
           const emailEnc = encodeURIComponent(r.email);
 
-          // Inject open tracking pixel
-          const pixel = `<img src="${serverUrl}/track/open?email=${emailEnc}&campaign=${campaign}&sheetId=${sid}&tab=${stab}" width="1" height="1" style="display:none" alt="" />`;
-          html = html.includes('</body>') ? html.replace('</body>', pixel+'</body>') : html + pixel;
+          // ✅ Inject open tracking pixel — always works now
+          const pixel = `<img src="${serverUrl}/track/open?email=${emailEnc}&campaign=${campaign}&sheetId=${sid}&tab=${stab}" width="1" height="1" style="display:none;border:0;" alt="" />`;
+          html = html.replace('</body>', pixel + '</body>');
 
-          // Wrap links for click tracking
+          // ✅ Wrap links for click tracking
           html = html.replace(/href="(https?:\/\/[^"]+)"/gi, (m, orig) => {
             if (orig.includes(serverUrl)) return m;
             const wrapped = `${serverUrl}/track/click?email=${emailEnc}&campaign=${campaign}&sheetId=${sid}&tab=${stab}&url=${encodeURIComponent(orig)}`;
             return `href="${wrapped}"`;
           });
 
-          // Add unsubscribe footer
+          // ✅ Add unsubscribe footer — always works now
           const unsubUrl = `${serverUrl}/unsubscribe?email=${emailEnc}&campaign=${campaign}&sheetId=${sid}&tab=${stab}`;
           const footer = `<div style="margin-top:28px;padding-top:14px;border-top:1px solid #e8eaed;text-align:center;font-family:Arial,sans-serif;font-size:11px;color:#9aa0a6;"><a href="${unsubUrl}" style="color:#9aa0a6;text-decoration:underline;">Unsubscribe</a></div>`;
-          html = html.includes('</body>') ? html.replace('</body>', footer+'</body>') : html + footer;
+          html = html.replace('</body>', footer + '</body>');
 
           const boundary = 'mm_'+Math.random().toString(36).slice(2);
-          const raw = [`From: ${sender}`,`To: ${r.email}`,`Subject: ${subject}`,`MIME-Version: 1.0`,`Content-Type: multipart/alternative; boundary="${boundary}"`,``,`--${boundary}`,`Content-Type: text/html; charset=UTF-8`,``,html,``,`--${boundary}--`].join('\r\n');
+          const raw = [
+            `From: ${sender}`,`To: ${r.email}`,`Subject: ${subject}`,
+            `MIME-Version: 1.0`,`Content-Type: multipart/alternative; boundary="${boundary}"`,
+            ``,`--${boundary}`,`Content-Type: text/html; charset=UTF-8`,``,html,``,`--${boundary}--`
+          ].join('\r\n');
           const encoded = Buffer.from(raw).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
 
           const sr = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
             method:'POST',
-            headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},
+            headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' },
             body: JSON.stringify({raw:encoded}),
           });
 
+          const srStatus = sr.status;
+          console.log(`📬 Gmail API response for ${r.email}: ${srStatus}`);
+
           if (sr.ok) {
             sent++;
-            // Update sheet using user token for EMAIL_SENT
-            if (sheetId) await updateSheetWithUserToken(token, sheetId, sheetTab||'Sheet1', r.email, 'EMAIL_SENT');
+            console.log(`✅ Email sent to ${r.email}`);
+            // ✅ Update sheet — uses user's own token
+            if (sheetId) {
+              await updateSheetWithUserToken(token, sheetId, sheetTab||'Sheet1', r.email, 'EMAIL_SENT');
+            }
+          } else {
+            const errBody = await sr.text();
+            console.log(`❌ Gmail send failed for ${r.email}: ${errBody.slice(0,200)}`);
           }
-        } catch(e) { console.error('Send error:', e.message); }
+        } catch(e) { console.error(`❌ Error sending to ${r.email}:`, e.message); }
         await sleep(400);
       }
 
       scheduleStore[id].status = 'done';
       scheduleStore[id].sent   = sent;
-      console.log(`✅ Job ${id} done: ${sent}/${recipients.length}`);
+      console.log(`✅ Job ${id} COMPLETE: ${sent}/${recipients.length} sent`);
     }, delay);
 
     res.json({ success:true, id, message:`Scheduled! ${recipients.length} emails will be sent at ${new Date(scheduledAt).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})}` });
