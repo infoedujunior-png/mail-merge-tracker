@@ -47,14 +47,67 @@ async function updateStatus(sheetId, tab, email, newStatus) {
     if ((P[cur]||0) >= (P[newStatus]||0)) return;
 
     const col = toCol(statCol+1);
+
+    // Write status text
     await sheets.spreadsheets.values.update({
       spreadsheetId: sheetId,
       range: `${tab||'Sheet1'}!${col}${targetRow}`,
       valueInputOption: 'USER_ENTERED',
       requestBody: { values: [[newStatus]] },
     });
+
+    // Apply cell color
+    await applyColor(sheets, sheetId, tab||'Sheet1', targetRow, statCol, newStatus);
+
     console.log(`✅ ${email} → ${newStatus}`);
   } catch(e) { console.error('updateStatus error:', e.message); }
+}
+
+// ── Apply background color to status cell ─────────────────
+async function applyColor(sheets, sheetId, tab, rowNum, colIdx, status) {
+  const COLORS = {
+    EMAIL_SENT:    { red: 0.90, green: 0.90, blue: 0.90 }, // gray
+    EMAIL_OPENED:  { red: 0.72, green: 0.91, blue: 0.74 }, // light green
+    EMAIL_CLICKED: { red: 0.18, green: 0.66, blue: 0.28 }, // dark green
+    EMAIL_BOUNCED: { red: 0.96, green: 0.49, blue: 0.45 }, // red
+    UNSUBSCRIBED:  { red: 1.00, green: 0.74, blue: 0.40 }, // orange
+  };
+  const color = COLORS[status];
+  if (!color) return;
+
+  try {
+    // Get sheet ID (gid)
+    const meta = await sheets.spreadsheets.get({ spreadsheetId: sheetId, fields: 'sheets.properties' });
+    const sheet = meta.data.sheets?.find(s => s.properties.title === tab);
+    const gid = sheet?.properties?.sheetId ?? 0;
+
+    const isBold = status === 'EMAIL_CLICKED' || status === 'EMAIL_BOUNCED';
+    const textColor = isBold ? { red:1, green:1, blue:1 } : { red:0.1, green:0.1, blue:0.1 };
+
+    await sheets.spreadsheets.batchUpdate({
+      spreadsheetId: sheetId,
+      requestBody: {
+        requests: [{
+          repeatCell: {
+            range: {
+              sheetId: gid,
+              startRowIndex: rowNum - 1,
+              endRowIndex: rowNum,
+              startColumnIndex: colIdx,
+              endColumnIndex: colIdx + 1,
+            },
+            cell: {
+              userEnteredFormat: {
+                backgroundColor: color,
+                textFormat: { bold: isBold, foregroundColor: textColor }
+              }
+            },
+            fields: 'userEnteredFormat(backgroundColor,textFormat)',
+          }
+        }]
+      }
+    });
+  } catch(e) { console.error('Color error:', e.message); }
 }
 
 async function logEvent(e) {
