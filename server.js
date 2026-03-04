@@ -98,6 +98,26 @@ async function updateStatus(sheetId, tab, email, newStatus) {
       const isBold=['EMAIL_CLICKED','EMAIL_BOUNCED'].includes(newStatus);
       await sheets.spreadsheets.batchUpdate({ spreadsheetId:sheetId, requestBody:{requests:[{repeatCell:{range:{sheetId:gid,startRowIndex:row-1,endRowIndex:row,startColumnIndex:statCol,endColumnIndex:statCol+1},cell:{userEnteredFormat:{backgroundColor:color,textFormat:{bold:isBold,foregroundColor:isBold?{red:1,green:1,blue:1}:{red:0.1,green:0.1,blue:0.1}}}},fields:'userEnteredFormat(backgroundColor,textFormat)'}}]}});
     }
+    // ✅ Add sent date/time as cell NOTE (shows on hover!)
+    if (newStatus === 'EMAIL_SENT' || newStatus === 'EMAIL_OPENED' || newStatus === 'EMAIL_CLICKED') {
+      try {
+        const now = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata',
+          day:'2-digit', month:'short', year:'numeric',
+          hour:'2-digit', minute:'2-digit', hour12:true });
+        const noteText = newStatus === 'EMAIL_SENT'    ? `📤 Sent on:\n${now}`
+                       : newStatus === 'EMAIL_OPENED'  ? `📬 Opened on:\n${now}`
+                       : `🖱️ Clicked on:\n${now}`;
+        await sheets.spreadsheets.batchUpdate({
+          spreadsheetId: sheetId,
+          requestBody: { requests: [{ updateCells: {
+            range: { sheetId: gid, startRowIndex: row-1, endRowIndex: row, startColumnIndex: statCol, endColumnIndex: statCol+1 },
+            rows: [{ values: [{ note: noteText }] }],
+            fields: 'note',
+          }}]}
+        });
+      } catch(e) { /* note is optional */ }
+    }
+
     console.log(`✅ ${email} → ${newStatus} row ${row}`);
   } catch(e) { console.error(`updateStatus error: ${e.message}`); }
 }
@@ -147,6 +167,32 @@ async function updateStatusUserToken(token, sheetId, tab, email, status) {
         });
       }
     } catch(e) {}
+    // ✅ Add sent datetime as cell note (hover tooltip)
+    if (['EMAIL_SENT','EMAIL_OPENED','EMAIL_CLICKED'].includes(status)) {
+      try {
+        const sheets2 = await getSheets();
+        const now = new Date().toLocaleString('en-IN', { timeZone:'Asia/Kolkata',
+          day:'2-digit', month:'short', year:'numeric', hour:'2-digit', minute:'2-digit', hour12:true });
+        const noteText = status === 'EMAIL_SENT'   ? `📤 Sent on:\n${now}`
+                       : status === 'EMAIL_OPENED' ? `📬 Opened on:\n${now}`
+                       : `🖱️ Clicked on:\n${now}`;
+        let gid2 = 0;
+        try {
+          const meta2 = await sheets2.spreadsheets.get({spreadsheetId:sheetId,fields:'sheets.properties'});
+          const sh2 = (meta2.data.sheets||[]).find(s=>s.properties.title===sheetTab);
+          gid2 = sh2?.properties?.sheetId ?? 0;
+        } catch(e){}
+        await sheets2.spreadsheets.batchUpdate({
+          spreadsheetId: sheetId,
+          requestBody: { requests: [{ updateCells: {
+            range: { sheetId:gid2, startRowIndex:row-1, endRowIndex:row, startColumnIndex:statCol, endColumnIndex:statCol+1 },
+            rows: [{ values: [{ note: noteText }] }],
+            fields: 'note',
+          }}]}
+        });
+      } catch(e) {}
+    }
+
     console.log(`✅ User-token: ${email} → ${status}`);
   } catch(e) { console.error('updateStatusUserToken:', e.message); }
 }
