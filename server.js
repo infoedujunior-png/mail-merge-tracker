@@ -126,7 +126,27 @@ async function updateStatusUserToken(token, sheetId, tab, email, status) {
     const cur=((rows[row-1]||[])[statCol]||'').toUpperCase().trim();
     if ((P[cur]||0)>=(P[status]||0)) return;
     await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(sheetTab+'!'+toCol(statCol+1)+row)}?valueInputOption=USER_ENTERED`,{method:'PUT',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify({values:[[status]]})});
-    try { const sh=await getSheets(); const color=STATUS_COLORS[status]; if(color){let gid=0;try{const m=await sh.spreadsheets.get({spreadsheetId:sheetId,fields:'sheets.properties'});const s=(m.data.sheets||[]).find(s=>s.properties.title===sheetTab);gid=s?.properties?.sheetId??0;}catch(e){}await sh.spreadsheets.batchUpdate({spreadsheetId:sheetId,requestBody:{requests:[{repeatCell:{range:{sheetId:gid,startRowIndex:row-1,endRowIndex:row,startColumnIndex:statCol,endColumnIndex:statCol+1},cell:{userEnteredFormat:{backgroundColor:color,textFormat:{bold:false}}},fields:'userEnteredFormat(backgroundColor,textFormat)'}}]}}});} } catch(e){}
+    // Apply color via service account
+    try {
+      const sh = await getSheets();
+      const color = STATUS_COLORS[status];
+      if (color) {
+        let gid = 0;
+        try {
+          const m = await sh.spreadsheets.get({ spreadsheetId: sheetId, fields: 'sheets.properties' });
+          const found = (m.data.sheets||[]).find(s => s.properties.title === sheetTab);
+          gid = found?.properties?.sheetId ?? 0;
+        } catch(e) {}
+        await sh.spreadsheets.batchUpdate({
+          spreadsheetId: sheetId,
+          requestBody: { requests: [{ repeatCell: {
+            range: { sheetId: gid, startRowIndex: row-1, endRowIndex: row, startColumnIndex: statCol, endColumnIndex: statCol+1 },
+            cell: { userEnteredFormat: { backgroundColor: color, textFormat: { bold: false } } },
+            fields: 'userEnteredFormat(backgroundColor,textFormat)',
+          }}]}
+        });
+      }
+    } catch(e) {}
     console.log(`✅ User-token: ${email} → ${status}`);
   } catch(e) { console.error('updateStatusUserToken:', e.message); }
 }
