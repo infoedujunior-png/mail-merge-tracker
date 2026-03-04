@@ -56,6 +56,7 @@ async function getAccessToken(userEmail) {
 }
 
 const STATUS_COLORS = {
+  SCHEDULED:     { red:0.68, green:0.85, blue:0.90 }, // light blue
   EMAIL_SENT:    { red:0.85, green:0.85, blue:0.85 },
   EMAIL_OPENED:  { red:0.72, green:0.94, blue:0.74 },
   EMAIL_CLICKED: { red:0.20, green:0.66, blue:0.33 },
@@ -87,7 +88,7 @@ async function updateStatus(sheetId, tab, email, newStatus) {
     let row=-1;
     for (let i=1;i<rows.length;i++) { if((rows[i][emailCol]||'').toLowerCase().trim()===email.toLowerCase().trim()){row=i+1;break;} }
     if (row<0) { console.log(`❌ Not found: ${email}`); return; }
-    const P={EMAIL_SENT:1,EMAIL_OPENED:2,EMAIL_CLICKED:3,EMAIL_BOUNCED:4,UNSUBSCRIBED:5};
+    const P={SCHEDULED:0,EMAIL_SENT:1,EMAIL_OPENED:2,EMAIL_CLICKED:3,EMAIL_BOUNCED:4,UNSUBSCRIBED:5};
     const cur=((rows[row-1]||[])[statCol]||'').toUpperCase().trim();
     if ((P[cur]||0)>=(P[newStatus]||0)) { console.log(`⏭️ Skip ${cur}>=${newStatus}`); return; }
     await sheets.spreadsheets.values.update({ spreadsheetId:sheetId, range:`${sheetTab}!${toCol(statCol+1)}${row}`, valueInputOption:'USER_ENTERED', requestBody:{values:[[newStatus]]} });
@@ -164,25 +165,26 @@ async function updateStatusUserToken(token, sheetId, tab, email, status) {
     let row=-1;
     for(let i=1;i<rows.length;i++){if((rows[i][emailCol]||'').toLowerCase().trim()===email.toLowerCase().trim()){row=i+1;break;}}
     if (row<0) return;
-    const P={EMAIL_SENT:1,EMAIL_OPENED:2,EMAIL_CLICKED:3,EMAIL_BOUNCED:4,UNSUBSCRIBED:5};
+    const P={SCHEDULED:0,EMAIL_SENT:1,EMAIL_OPENED:2,EMAIL_CLICKED:3,EMAIL_BOUNCED:4,UNSUBSCRIBED:5};
     const cur=((rows[row-1]||[])[statCol]||'').toUpperCase().trim();
     if ((P[cur]||0)>=(P[status]||0)) return;
     await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(sheetTab+'!'+toCol(statCol+1)+row)}?valueInputOption=USER_ENTERED`,{method:'PUT',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify({values:[[status]]})});
-    // ✅ Color + Note — single updateCells call via service account
+    // ✅ Color + Note via USER TOKEN (same token used for sheet write)
     try {
-      const sh = await getSheets();
-      let gid = 0;
-      try {
-        const m = await sh.spreadsheets.get({ spreadsheetId:sheetId, fields:'sheets.properties' });
-        const found = (m.data.sheets||[]).find(s => s.properties.title === sheetTab);
-        gid = found?.properties?.sheetId ?? 0;
-      } catch(e) {}
-
-      const color   = STATUS_COLORS[status];
-      const isBold  = ['EMAIL_CLICKED','EMAIL_BOUNCED'].includes(status);
       const nowStr  = new Date().toLocaleString('en-IN', { timeZone:'Asia/Kolkata', day:'2-digit', month:'short', year:'numeric', hour:'2-digit', minute:'2-digit', hour12:true });
       const noteMap = { EMAIL_SENT:'Sent', EMAIL_OPENED:'Opened', EMAIL_CLICKED:'Clicked', EMAIL_BOUNCED:'Bounced', UNSUBSCRIBED:'Unsubscribed' };
       const noteText = (noteMap[status]||status) + ' on: ' + nowStr;
+      const color    = STATUS_COLORS[status];
+      const isBold   = ['EMAIL_CLICKED','EMAIL_BOUNCED'].includes(status);
+
+      // Get GID via user token
+      let gid = 0;
+      try {
+        const metaRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}?fields=sheets.properties`, { headers:{Authorization:`Bearer ${token}`} });
+        const metaData = await metaRes.json();
+        const sheetObj = (metaData.sheets||[]).find(s => s.properties.title === sheetTab);
+        gid = sheetObj?.properties?.sheetId ?? 0;
+      } catch(e) {}
 
       const cellValue = { note: noteText };
       if (color) {
@@ -193,16 +195,24 @@ async function updateStatusUserToken(token, sheetId, tab, email, status) {
       }
       const fieldMask = color ? 'note,userEnteredFormat(backgroundColor,textFormat)' : 'note';
 
-      await sh.spreadsheets.batchUpdate({
-        spreadsheetId: sheetId,
-        requestBody: { requests: [{ updateCells: {
+      // batchUpdate via USER TOKEN
+      const batchRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}:batchUpdate`, {
+        method: 'POST',
+        headers: { Authorization:`Bearer ${token}`, 'Content-Type':'application/json' },
+        body: JSON.stringify({ requests: [{ updateCells: {
           range: { sheetId:gid, startRowIndex:row-1, endRowIndex:row, startColumnIndex:statCol, endColumnIndex:statCol+1 },
           rows: [{ values: [cellValue] }],
           fields: fieldMask,
-        }}]}
+        }}]})
       });
-      console.log('✅ Color+Note (user-token):', noteText);
-    } catch(e) { console.error('❌ Color+Note error:', e.message); }
+
+      if (batchRes.ok) {
+        console.log('✅ Color+Note (user-token):', noteText);
+      } else {
+        const errText = await batchRes.text();
+        console.error('❌ Color+Note error:', errText.slice(0,200));
+      }
+    } catch(e) { console.error('❌ Color+Note exception:', e.message); }
 
     console.log(`✅ User-token: ${email} → ${status}`);
   } catch(e) { console.error('updateStatusUserToken:', e.message); }
