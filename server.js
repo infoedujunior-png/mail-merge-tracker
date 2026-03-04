@@ -91,31 +91,49 @@ async function updateStatus(sheetId, tab, email, newStatus) {
     const cur=((rows[row-1]||[])[statCol]||'').toUpperCase().trim();
     if ((P[cur]||0)>=(P[newStatus]||0)) { console.log(`⏭️ Skip ${cur}>=${newStatus}`); return; }
     await sheets.spreadsheets.values.update({ spreadsheetId:sheetId, range:`${sheetTab}!${toCol(statCol+1)}${row}`, valueInputOption:'USER_ENTERED', requestBody:{values:[[newStatus]]} });
-    const color=STATUS_COLORS[newStatus];
+
+    // ✅ Get gid ONCE — used for both color AND note
+    let gid = 0;
+    try {
+      const m = await sheets.spreadsheets.get({ spreadsheetId:sheetId, fields:'sheets.properties' });
+      const sh = (m.data.sheets||[]).find(s => s.properties.title === sheetTab);
+      gid = sh?.properties?.sheetId ?? 0;
+    } catch(e) {}
+
+    // Apply background color
+    const color = STATUS_COLORS[newStatus];
     if (color) {
-      let gid=0;
-      try { const m=await sheets.spreadsheets.get({spreadsheetId:sheetId,fields:'sheets.properties'}); const sh=(m.data.sheets||[]).find(s=>s.properties.title===sheetTab); gid=sh?.properties?.sheetId??0; } catch(e){}
-      const isBold=['EMAIL_CLICKED','EMAIL_BOUNCED'].includes(newStatus);
-      await sheets.spreadsheets.batchUpdate({ spreadsheetId:sheetId, requestBody:{requests:[{repeatCell:{range:{sheetId:gid,startRowIndex:row-1,endRowIndex:row,startColumnIndex:statCol,endColumnIndex:statCol+1},cell:{userEnteredFormat:{backgroundColor:color,textFormat:{bold:isBold,foregroundColor:isBold?{red:1,green:1,blue:1}:{red:0.1,green:0.1,blue:0.1}}}},fields:'userEnteredFormat(backgroundColor,textFormat)'}}]}});
+      const isBold = ['EMAIL_CLICKED','EMAIL_BOUNCED'].includes(newStatus);
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId: sheetId,
+        requestBody: { requests: [{ repeatCell: {
+          range: { sheetId:gid, startRowIndex:row-1, endRowIndex:row, startColumnIndex:statCol, endColumnIndex:statCol+1 },
+          cell: { userEnteredFormat: { backgroundColor:color, textFormat:{ bold:isBold, foregroundColor: isBold?{red:1,green:1,blue:1}:{red:0.1,green:0.1,blue:0.1} } } },
+          fields: 'userEnteredFormat(backgroundColor,textFormat)',
+        }}]}
+      });
     }
-    // ✅ Add sent date/time as cell NOTE (shows on hover!)
-    if (newStatus === 'EMAIL_SENT' || newStatus === 'EMAIL_OPENED' || newStatus === 'EMAIL_CLICKED') {
+
+    // ✅ Add date/time as cell NOTE — shows on hover!
+    if (['EMAIL_SENT','EMAIL_OPENED','EMAIL_CLICKED','EMAIL_BOUNCED','UNSUBSCRIBED'].includes(newStatus)) {
       try {
-        const now = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata',
-          day:'2-digit', month:'short', year:'numeric',
-          hour:'2-digit', minute:'2-digit', hour12:true });
-        const noteText = newStatus === 'EMAIL_SENT'    ? `📤 Sent on:\n${now}`
-                       : newStatus === 'EMAIL_OPENED'  ? `📬 Opened on:\n${now}`
-                       : `🖱️ Clicked on:\n${now}`;
+        const now = new Date().toLocaleString('en-IN', {
+          timeZone:'Asia/Kolkata', day:'2-digit', month:'short',
+          year:'numeric', hour:'2-digit', minute:'2-digit', hour12:true
+        });
+        const icons = { EMAIL_SENT:'📤 Sent', EMAIL_OPENED:'📬 Opened', EMAIL_CLICKED:'🖱️ Clicked', EMAIL_BOUNCED:'🔴 Bounced', UNSUBSCRIBED:'🚫 Unsubscribed' };
+        const noteText = `${icons[newStatus]} on:
+${now}`;
         await sheets.spreadsheets.batchUpdate({
           spreadsheetId: sheetId,
           requestBody: { requests: [{ updateCells: {
-            range: { sheetId: gid, startRowIndex: row-1, endRowIndex: row, startColumnIndex: statCol, endColumnIndex: statCol+1 },
+            range: { sheetId:gid, startRowIndex:row-1, endRowIndex:row, startColumnIndex:statCol, endColumnIndex:statCol+1 },
             rows: [{ values: [{ note: noteText }] }],
             fields: 'note',
           }}]}
         });
-      } catch(e) { /* note is optional */ }
+        console.log(`📝 Note added for ${email}: ${noteText.split('\n')[0]}`);
+      } catch(e) { console.log('Note error:', e.message); }
     }
 
     console.log(`✅ ${email} → ${newStatus} row ${row}`);
