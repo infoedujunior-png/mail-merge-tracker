@@ -92,7 +92,7 @@ async function updateStatus(sheetId, tab, email, newStatus) {
     if ((P[cur]||0)>=(P[newStatus]||0)) { console.log(`⏭️ Skip ${cur}>=${newStatus}`); return; }
     await sheets.spreadsheets.values.update({ spreadsheetId:sheetId, range:`${sheetTab}!${toCol(statCol+1)}${row}`, valueInputOption:'USER_ENTERED', requestBody:{values:[[newStatus]]} });
 
-    // ✅ Get gid ONCE — used for both color AND note
+    // ✅ Get sheet GID
     let gid = 0;
     try {
       const m = await sheets.spreadsheets.get({ spreadsheetId:sheetId, fields:'sheets.properties' });
@@ -100,41 +100,33 @@ async function updateStatus(sheetId, tab, email, newStatus) {
       gid = sh?.properties?.sheetId ?? 0;
     } catch(e) {}
 
-    // Apply background color
-    const color = STATUS_COLORS[newStatus];
+    // ✅ Single batchUpdate — color + note together
+    const color   = STATUS_COLORS[newStatus];
+    const isBold  = ['EMAIL_CLICKED','EMAIL_BOUNCED'].includes(newStatus);
+    const nowStr  = new Date().toLocaleString('en-IN', { timeZone:'Asia/Kolkata', day:'2-digit', month:'short', year:'numeric', hour:'2-digit', minute:'2-digit', hour12:true });
+    const noteMap = { EMAIL_SENT:'Sent', EMAIL_OPENED:'Opened', EMAIL_CLICKED:'Clicked', EMAIL_BOUNCED:'Bounced', UNSUBSCRIBED:'Unsubscribed' };
+    const noteText = (noteMap[newStatus] || newStatus) + ' on: ' + nowStr;
+    const cellRange = { sheetId:gid, startRowIndex:row-1, endRowIndex:row, startColumnIndex:statCol, endColumnIndex:statCol+1 };
+    const batchReqs = [];
+
     if (color) {
-      const isBold = ['EMAIL_CLICKED','EMAIL_BOUNCED'].includes(newStatus);
-      await sheets.spreadsheets.batchUpdate({
-        spreadsheetId: sheetId,
-        requestBody: { requests: [{ repeatCell: {
-          range: { sheetId:gid, startRowIndex:row-1, endRowIndex:row, startColumnIndex:statCol, endColumnIndex:statCol+1 },
-          cell: { userEnteredFormat: { backgroundColor:color, textFormat:{ bold:isBold, foregroundColor: isBold?{red:1,green:1,blue:1}:{red:0.1,green:0.1,blue:0.1} } } },
-          fields: 'userEnteredFormat(backgroundColor,textFormat)',
-        }}]}
-      });
+      batchReqs.push({ repeatCell: {
+        range: cellRange,
+        cell: { userEnteredFormat: { backgroundColor:color, textFormat:{ bold:isBold, foregroundColor:isBold?{red:1,green:1,blue:1}:{red:0.1,green:0.1,blue:0.1} } } },
+        fields: 'userEnteredFormat(backgroundColor,textFormat)',
+      }});
     }
 
-    // ✅ Add date/time as cell NOTE — shows on hover!
-    if (['EMAIL_SENT','EMAIL_OPENED','EMAIL_CLICKED','EMAIL_BOUNCED','UNSUBSCRIBED'].includes(newStatus)) {
-      try {
-        const now = new Date().toLocaleString('en-IN', {
-          timeZone:'Asia/Kolkata', day:'2-digit', month:'short',
-          year:'numeric', hour:'2-digit', minute:'2-digit', hour12:true
-        });
-        const icons = { EMAIL_SENT:'📤 Sent', EMAIL_OPENED:'📬 Opened', EMAIL_CLICKED:'🖱️ Clicked', EMAIL_BOUNCED:'🔴 Bounced', UNSUBSCRIBED:'🚫 Unsubscribed' };
-        const noteText = `${icons[newStatus]} on:
-${now}`;
-        await sheets.spreadsheets.batchUpdate({
-          spreadsheetId: sheetId,
-          requestBody: { requests: [{ updateCells: {
-            range: { sheetId:gid, startRowIndex:row-1, endRowIndex:row, startColumnIndex:statCol, endColumnIndex:statCol+1 },
-            rows: [{ values: [{ note: noteText }] }],
-            fields: 'note',
-          }}]}
-        });
-        console.log(`📝 Note added for ${email}: ${noteText.split('\n')[0]}`);
-      } catch(e) { console.log('Note error:', e.message); }
-    }
+    batchReqs.push({ updateCells: {
+      range: cellRange,
+      rows: [{ values: [{ note: noteText }] }],
+      fields: 'note',
+    }});
+
+    try {
+      await sheets.spreadsheets.batchUpdate({ spreadsheetId:sheetId, requestBody:{ requests:batchReqs } });
+      console.log('🎨📝 ' + noteText);
+    } catch(e) { console.error('batchUpdate error:', e.message); }
 
     console.log(`✅ ${email} → ${newStatus} row ${row}`);
   } catch(e) { console.error(`updateStatus error: ${e.message}`); }
