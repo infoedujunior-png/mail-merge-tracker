@@ -95,38 +95,50 @@ async function updateStatus(sheetId, tab, email, newStatus) {
     // ✅ Get sheet GID
     let gid = 0;
     try {
-      const m = await sheets.spreadsheets.get({ spreadsheetId:sheetId, fields:'sheets.properties' });
-      const sh = (m.data.sheets||[]).find(s => s.properties.title === sheetTab);
-      gid = sh?.properties?.sheetId ?? 0;
-    } catch(e) {}
+      const meta = await sheets.spreadsheets.get({ spreadsheetId:sheetId, fields:'sheets.properties' });
+      const sheetObj = (meta.data.sheets||[]).find(s => s.properties.title === sheetTab);
+      gid = sheetObj?.properties?.sheetId ?? 0;
+    } catch(e) { console.log('GID fetch error:', e.message); }
 
-    // ✅ Single batchUpdate — color + note together
-    const color   = STATUS_COLORS[newStatus];
-    const isBold  = ['EMAIL_CLICKED','EMAIL_BOUNCED'].includes(newStatus);
-    const nowStr  = new Date().toLocaleString('en-IN', { timeZone:'Asia/Kolkata', day:'2-digit', month:'short', year:'numeric', hour:'2-digit', minute:'2-digit', hour12:true });
+    console.log('GID:', gid, '| row:', row, '| statCol:', statCol);
+
+    // ✅ Use ONE updateCells request — sets BOTH color AND note together
+    const color  = STATUS_COLORS[newStatus];
+    const isBold = ['EMAIL_CLICKED','EMAIL_BOUNCED'].includes(newStatus);
+    const nowStr = new Date().toLocaleString('en-IN', {
+      timeZone:'Asia/Kolkata', day:'2-digit', month:'short',
+      year:'numeric', hour:'2-digit', minute:'2-digit', hour12:true
+    });
     const noteMap = { EMAIL_SENT:'Sent', EMAIL_OPENED:'Opened', EMAIL_CLICKED:'Clicked', EMAIL_BOUNCED:'Bounced', UNSUBSCRIBED:'Unsubscribed' };
-    const noteText = (noteMap[newStatus] || newStatus) + ' on: ' + nowStr;
-    const cellRange = { sheetId:gid, startRowIndex:row-1, endRowIndex:row, startColumnIndex:statCol, endColumnIndex:statCol+1 };
-    const batchReqs = [];
+    const noteText = (noteMap[newStatus]||newStatus) + ' on: ' + nowStr;
 
+    const cellValue = {
+      note: noteText,
+    };
     if (color) {
-      batchReqs.push({ repeatCell: {
-        range: cellRange,
-        cell: { userEnteredFormat: { backgroundColor:color, textFormat:{ bold:isBold, foregroundColor:isBold?{red:1,green:1,blue:1}:{red:0.1,green:0.1,blue:0.1} } } },
-        fields: 'userEnteredFormat(backgroundColor,textFormat)',
-      }});
+      cellValue.userEnteredFormat = {
+        backgroundColor: color,
+        textFormat: {
+          bold: isBold,
+          foregroundColor: isBold ? {red:1,green:1,blue:1} : {red:0.1,green:0.1,blue:0.1}
+        }
+      };
     }
 
-    batchReqs.push({ updateCells: {
-      range: cellRange,
-      rows: [{ values: [{ note: noteText }] }],
-      fields: 'note',
-    }});
-
     try {
-      await sheets.spreadsheets.batchUpdate({ spreadsheetId:sheetId, requestBody:{ requests:batchReqs } });
-      console.log('🎨📝 ' + noteText);
-    } catch(e) { console.error('batchUpdate error:', e.message); }
+      const fieldMask = color ? 'note,userEnteredFormat(backgroundColor,textFormat)' : 'note';
+      await sheets.spreadsheets.batchUpdate({
+        spreadsheetId: sheetId,
+        requestBody: { requests: [{
+          updateCells: {
+            range: { sheetId:gid, startRowIndex:row-1, endRowIndex:row, startColumnIndex:statCol, endColumnIndex:statCol+1 },
+            rows: [{ values: [cellValue] }],
+            fields: fieldMask,
+          }
+        }]}
+      });
+      console.log('✅ Color+Note OK:', noteText);
+    } catch(e) { console.error('❌ batchUpdate FAILED:', e.message, JSON.stringify(e.errors||[])); }
 
     console.log(`✅ ${email} → ${newStatus} row ${row}`);
   } catch(e) { console.error(`updateStatus error: ${e.message}`); }
@@ -156,52 +168,41 @@ async function updateStatusUserToken(token, sheetId, tab, email, status) {
     const cur=((rows[row-1]||[])[statCol]||'').toUpperCase().trim();
     if ((P[cur]||0)>=(P[status]||0)) return;
     await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(sheetTab+'!'+toCol(statCol+1)+row)}?valueInputOption=USER_ENTERED`,{method:'PUT',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify({values:[[status]]})});
-    // Apply color via service account
+    // ✅ Color + Note — single updateCells call via service account
     try {
       const sh = await getSheets();
-      const color = STATUS_COLORS[status];
-      if (color) {
-        let gid = 0;
-        try {
-          const m = await sh.spreadsheets.get({ spreadsheetId: sheetId, fields: 'sheets.properties' });
-          const found = (m.data.sheets||[]).find(s => s.properties.title === sheetTab);
-          gid = found?.properties?.sheetId ?? 0;
-        } catch(e) {}
-        await sh.spreadsheets.batchUpdate({
-          spreadsheetId: sheetId,
-          requestBody: { requests: [{ repeatCell: {
-            range: { sheetId: gid, startRowIndex: row-1, endRowIndex: row, startColumnIndex: statCol, endColumnIndex: statCol+1 },
-            cell: { userEnteredFormat: { backgroundColor: color, textFormat: { bold: false } } },
-            fields: 'userEnteredFormat(backgroundColor,textFormat)',
-          }}]}
-        });
-      }
-    } catch(e) {}
-    // ✅ Add sent datetime as cell note (hover tooltip)
-    if (['EMAIL_SENT','EMAIL_OPENED','EMAIL_CLICKED'].includes(status)) {
+      let gid = 0;
       try {
-        const sheets2 = await getSheets();
-        const now = new Date().toLocaleString('en-IN', { timeZone:'Asia/Kolkata',
-          day:'2-digit', month:'short', year:'numeric', hour:'2-digit', minute:'2-digit', hour12:true });
-        const noteText = status === 'EMAIL_SENT'   ? `📤 Sent on:\n${now}`
-                       : status === 'EMAIL_OPENED' ? `📬 Opened on:\n${now}`
-                       : `🖱️ Clicked on:\n${now}`;
-        let gid2 = 0;
-        try {
-          const meta2 = await sheets2.spreadsheets.get({spreadsheetId:sheetId,fields:'sheets.properties'});
-          const sh2 = (meta2.data.sheets||[]).find(s=>s.properties.title===sheetTab);
-          gid2 = sh2?.properties?.sheetId ?? 0;
-        } catch(e){}
-        await sheets2.spreadsheets.batchUpdate({
-          spreadsheetId: sheetId,
-          requestBody: { requests: [{ updateCells: {
-            range: { sheetId:gid2, startRowIndex:row-1, endRowIndex:row, startColumnIndex:statCol, endColumnIndex:statCol+1 },
-            rows: [{ values: [{ note: noteText }] }],
-            fields: 'note',
-          }}]}
-        });
+        const m = await sh.spreadsheets.get({ spreadsheetId:sheetId, fields:'sheets.properties' });
+        const found = (m.data.sheets||[]).find(s => s.properties.title === sheetTab);
+        gid = found?.properties?.sheetId ?? 0;
       } catch(e) {}
-    }
+
+      const color   = STATUS_COLORS[status];
+      const isBold  = ['EMAIL_CLICKED','EMAIL_BOUNCED'].includes(status);
+      const nowStr  = new Date().toLocaleString('en-IN', { timeZone:'Asia/Kolkata', day:'2-digit', month:'short', year:'numeric', hour:'2-digit', minute:'2-digit', hour12:true });
+      const noteMap = { EMAIL_SENT:'Sent', EMAIL_OPENED:'Opened', EMAIL_CLICKED:'Clicked', EMAIL_BOUNCED:'Bounced', UNSUBSCRIBED:'Unsubscribed' };
+      const noteText = (noteMap[status]||status) + ' on: ' + nowStr;
+
+      const cellValue = { note: noteText };
+      if (color) {
+        cellValue.userEnteredFormat = {
+          backgroundColor: color,
+          textFormat: { bold:isBold, foregroundColor: isBold?{red:1,green:1,blue:1}:{red:0.1,green:0.1,blue:0.1} }
+        };
+      }
+      const fieldMask = color ? 'note,userEnteredFormat(backgroundColor,textFormat)' : 'note';
+
+      await sh.spreadsheets.batchUpdate({
+        spreadsheetId: sheetId,
+        requestBody: { requests: [{ updateCells: {
+          range: { sheetId:gid, startRowIndex:row-1, endRowIndex:row, startColumnIndex:statCol, endColumnIndex:statCol+1 },
+          rows: [{ values: [cellValue] }],
+          fields: fieldMask,
+        }}]}
+      });
+      console.log('✅ Color+Note (user-token):', noteText);
+    } catch(e) { console.error('❌ Color+Note error:', e.message); }
 
     console.log(`✅ User-token: ${email} → ${status}`);
   } catch(e) { console.error('updateStatusUserToken:', e.message); }
