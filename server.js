@@ -7,6 +7,8 @@
 
 const express = require('express');
 const cors    = require('cors');
+const fs      = require('fs');
+const path    = require('path');
 const { google } = require('googleapis');
 const app = express();
 app.use(cors());
@@ -16,8 +18,44 @@ const PIXEL = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBR
 
 const trackingStore = {};
 const scheduleStore = {};
-const userStore     = {}; // { email: { refreshToken, accessToken, sheetId, sheetTab } }
 let lastBounceCheck = 0;
+
+// ══════════════════════════════════════════════════════════
+//  PERSISTENT TOKEN STORAGE — survives Render restarts! ✅
+// ══════════════════════════════════════════════════════════
+const TOKENS_FILE = path.join('/tmp', 'edujunior_tokens.json');
+
+function loadUserStore() {
+  try {
+    if (fs.existsSync(TOKENS_FILE)) {
+      const data = JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf8'));
+      console.log(`📂 Loaded ${Object.keys(data).length} users from disk`);
+      return data;
+    }
+  } catch(e) { console.error('Load tokens error:', e.message); }
+  return {};
+}
+
+function saveUserStore() {
+  try {
+    // Save only essential fields — not processedBounces Set (not serializable)
+    const toSave = {};
+    for (const [email, user] of Object.entries(userStore)) {
+      toSave[email] = {
+        refreshToken: user.refreshToken,
+        accessToken:  user.accessToken,
+        sheetId:      user.sheetId,
+        sheetTab:     user.sheetTab,
+        savedAt:      user.savedAt,
+      };
+    }
+    fs.writeFileSync(TOKENS_FILE, JSON.stringify(toSave, null, 2));
+    console.log(`💾 Saved ${Object.keys(toSave).length} users to disk`);
+  } catch(e) { console.error('Save tokens error:', e.message); }
+}
+
+// Load on startup
+const userStore = loadUserStore();
 
 // ── Service Account Sheets ─────────────────────────────────
 async function getSheets() {
@@ -47,6 +85,7 @@ async function getAccessToken(userEmail) {
     const data = await res.json();
     if (data.access_token) {
       user.accessToken = data.access_token;
+      saveUserStore(); // ✅ Save latest access token
       console.log(`🔑 Token refreshed for ${userEmail}`);
       return data.access_token;
     }
@@ -542,6 +581,7 @@ app.post('/auth/save-token', async (req,res) => {
     const tokens=await tr.json();
     console.log(`Token status: ${tr.status} | refresh_token: ${!!tokens.refresh_token}`);
     userStore[userEmail]={refreshToken:tokens.refresh_token||null,accessToken:tokens.access_token||accessToken,sheetId:sheetId||'',sheetTab:sheetTab||'Sheet1',savedAt:new Date().toISOString()};
+    saveUserStore(); // ✅ Write to disk immediately!
     console.log(`✅ ${userEmail} saved! has refresh: ${!!tokens.refresh_token}`);
     res.json({success:true,hasRefreshToken:!!tokens.refresh_token});
   } catch(e){console.error('save-token:',e.message);res.status(500).json({error:e.message});}
@@ -553,6 +593,7 @@ app.post('/auth/update-sheet',(req,res)=>{
     if(!userStore[userEmail])userStore[userEmail]={};
     if(sheetId)userStore[userEmail].sheetId=sheetId;
     if(sheetTab)userStore[userEmail].sheetTab=sheetTab;
+    saveUserStore(); // ✅ Persist to disk
     console.log(`📋 Sheet updated for ${userEmail}: ${sheetId}/${sheetTab}`);
   }
   res.json({success:true});
