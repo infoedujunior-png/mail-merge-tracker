@@ -232,7 +232,7 @@ async function checkBouncesForUser(userEmail) {
   const token = await getAccessToken(userEmail);
   if (!token) return;
   try {
-    const q = encodeURIComponent('from:(mailer-daemon OR postmaster) newer_than:3d');
+    const q = encodeURIComponent('(from:(mailer-daemon OR postmaster OR noreply) subject:(delivery OR undelivered OR bounce OR failed OR rejected OR returned OR "could not" OR "failure notice" OR "mail delivery")) newer_than:3d');
     const res = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${q}&maxResults=30`,{headers:{Authorization:`Bearer ${token}`}});
     if (!res.ok) return;
     const data = await res.json();
@@ -287,22 +287,116 @@ function getEmailBody(payload) {
 }
 
 function parseBounce(body) {
-  const b=body.toLowerCase();
-  let email='';
-  const patterns=[
-    /(?:failed to deliver|undeliverable|final recipient).*?([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})/i,
-    /original-recipient:.*?([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})/i,
+  const b = body.toLowerCase();
+
+  // ── Extract bounced email address ─────────────────────────
+  let email = '';
+
+  // Try DSN headers first (most reliable)
+  const dsnPatterns = [
+    /final-recipient:\s*rfc822;\s*([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})/i,
+    /original-recipient:\s*rfc822;\s*([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})/i,
+    /(?:failed to deliver(?:y)?|delivery has failed|undeliverable|could not be delivered)\s+(?:to\s+)?<?([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})>?/i,
+    /(?:the\s+following\s+(?:address|recipient)s?\s+(?:failed|could not))[^@]*([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})/i,
+    /(?:to|recipient):\s*<?([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})>?/i,
     /([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})/i,
   ];
-  for (const p of patterns){const m=body.match(p);if(m?.[1]&&!m[1].includes('mailer-daemon')&&!m[1].includes('postmaster')){email=m[1].toLowerCase();break;}}
-  let reason='Delivery Failed';
-  if (b.includes('user unknown')||b.includes('no such user')||b.includes('address not found')) reason='Address Not Found';
-  else if (b.includes('mailbox full')||b.includes('quota exceeded')) reason='Mailbox Full';
-  else if (b.includes('spam')||b.includes('blocked')||b.includes('blacklist')) reason='Message Blocked';
-  else if (b.includes('rejected')||b.includes('550')||b.includes('554')) reason='Message Rejected';
-  else if (b.includes('domain')||b.includes('host not found')) reason='Domain Not Found';
-  else if (b.includes('disabled')||b.includes('suspended')) reason='Account Disabled';
-  return {email,reason};
+
+  const SKIP = ['mailer-daemon','postmaster','noreply','no-reply','bounce','return'];
+  for (const p of dsnPatterns) {
+    const m = body.match(p);
+    if (m?.[1]) {
+      const candidate = m[1].toLowerCase().trim();
+      if (!SKIP.some(s => candidate.includes(s))) {
+        email = candidate; break;
+      }
+    }
+  }
+
+  // ── Extract SMTP status code ───────────────────────────────
+  const codeMatch = body.match(/(4\d\d|5\d\d)/);
+  const smtpCode  = codeMatch ? parseInt(codeMatch[1]) : 0;
+
+  // ── Extract enhanced status code (e.g. 5.1.1, 5.7.1) ─────
+  const enhMatch = body.match(/([45]\.\d+\.\d+)/);
+  const enhCode  = enhMatch ? enhMatch[1] : '';
+
+  // ── Detect reason (order matters — most specific first) ───
+  let reason = 'Delivery Failed';
+
+  // Invalid / non-existent address
+  if (
+    b.includes('user unknown') || b.includes('no such user') ||
+    b.includes('does not exist') || b.includes('invalid address') ||
+    b.includes('address rejected') || b.includes('bad destination') ||
+    b.includes('invalid recipient') || b.includes('recipient address rejected') ||
+    b.includes('no mailbox') || b.includes('unknown address') ||
+    b.includes('unknown user') || b.includes('address not found') ||
+    enhCode === '5.1.1' || enhCode === '5.1.2' || enhCode === '5.1.3'
+  ) reason = 'Invalid Address';
+
+  // Mailbox full / over quota
+  else if (
+    b.includes('mailbox full') || b.includes('over quota') ||
+    b.includes('quota exceeded') || b.includes('storage full') ||
+    b.includes('insufficient storage') || b.includes('mailbox size') ||
+    enhCode === '4.2.2' || enhCode === '5.2.2'
+  ) reason = 'Mailbox Full';
+
+  // Account disabled / suspended / closed
+  else if (
+    b.includes('account disabled') || b.includes('account suspended') ||
+    b.includes('account closed') || b.includes('account has been') ||
+    b.includes('no longer active') || b.includes('deactivated') ||
+    b.includes('account inactive') || enhCode === '5.1.6'
+  ) reason = 'Account Disabled';
+
+  // Domain not found / DNS error
+  else if (
+    b.includes('domain not found') || b.includes('no such domain') ||
+    b.includes('host not found') || b.includes('dns') ||
+    b.includes('name or service not known') || b.includes('mx record') ||
+    b.includes('could not find host') || b.includes('domain does not exist') ||
+    enhCode === '5.1.2' || enhCode === '5.4.4'
+  ) reason = 'Domain Not Found';
+
+  // Spam / content blocked
+  else if (
+    b.includes('spam') || b.includes('spamhaus') || b.includes('spamcop') ||
+    b.includes('bulk mail') || b.includes('junk') || b.includes('ucе') ||
+    b.includes('content policy') || b.includes('message content') ||
+    b.includes('policy violation') || b.includes('abuse') ||
+    enhCode === '5.7.1' || enhCode === '5.7.9'
+  ) reason = 'Message Blocked (Spam)';
+
+  // Blacklisted IP / sender blocked
+  else if (
+    b.includes('blacklist') || b.includes('blocklist') ||
+    b.includes('blocked') || b.includes('sender blocked') ||
+    b.includes('ip blocked') || b.includes('sender reputation') ||
+    b.includes('dmarc') || b.includes('spf') || b.includes('dkim') ||
+    enhCode === '5.7.0' || enhCode === '5.7.26'
+  ) reason = 'Sender Blocked';
+
+  // Rejected by server
+  else if (
+    b.includes('rejected') || b.includes('permanently rejected') ||
+    b.includes('transaction failed') || smtpCode === 550 ||
+    smtpCode === 554 || smtpCode === 551
+  ) reason = 'Message Rejected';
+
+  // Temporary failure (4xx)
+  else if (smtpCode >= 400 && smtpCode < 500) {
+    reason = 'Temporary Failure (Retry)';
+  }
+
+  // Generic relay/routing error
+  else if (
+    b.includes('relay') || b.includes('routing') ||
+    b.includes('not permitted') || b.includes('not allowed')
+  ) reason = 'Relay Denied';
+
+  return { email, reason, smtpCode, enhCode };
 }
 
 async function checkAllBounces() {
