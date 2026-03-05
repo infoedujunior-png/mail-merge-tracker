@@ -341,7 +341,7 @@ async function checkBouncesForUser(userEmail) {
         continue;
       }
 
-      const info = parseBounce(full, hdrs);
+      const info = parseBounce(full, hdrs, userEmail); // ✅ Pass sender to exclude it
       console.log(`  → Parsed: email="${info.email}" reason="${info.reason}" smtp=${info.smtpCode} enh=${info.enhCode}`);
 
       if (info.email) {
@@ -403,38 +403,65 @@ function getEmailBody(payload) {
   return t.slice(0, 8000); // Enough context
 }
 
-function parseBounce(text, headers = []) {
+function parseBounce(text, headers = [], senderEmail = '') {
   const b = text.toLowerCase();
 
   // ── 1. Try DSN headers (most reliable source) ─────────────
   let email = '';
+  // Always skip sender email + common system addresses
+  const senderLower = (senderEmail || '').toLowerCase();
   const SKIP = ['mailer-daemon','postmaster','noreply','no-reply','bounce','return','daemon'];
 
-  // Check email headers — X-Failed-Recipients is very reliable
-  const headerNames = ['x-failed-recipients','x-original-to','delivered-to','final-recipient'];
+  function isValidRecipient(addr) {
+    const a = addr.toLowerCase().trim();
+    if (!a || !a.includes('@')) return false;
+    if (SKIP.some(s => a.includes(s))) return false;
+    if (senderLower && a === senderLower) return false; // ✅ Exclude sender!
+    return true;
+  }
+
+  // ── 1. DSN Headers first (most reliable) ──────────────────
+  // X-Failed-Recipients is the BEST source — explicitly lists failed address
+  const priorityHeaders = ['x-failed-recipients', 'x-original-to', 'final-recipient', 'original-recipient'];
   for (const hdr of headers) {
-    if (headerNames.includes(hdr.name?.toLowerCase())) {
+    if (priorityHeaders.includes(hdr.name?.toLowerCase())) {
       const m = hdr.value?.match(/([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})/i);
-      if (m?.[1] && !SKIP.some(s => m[1].toLowerCase().includes(s))) {
-        email = m[1].toLowerCase(); break;
+      if (m?.[1] && isValidRecipient(m[1])) {
+        email = m[1].toLowerCase();
+        console.log(`  → Email from header "${hdr.name}": ${email}`);
+        break;
       }
     }
   }
 
-  // ── 2. Try body patterns if headers didn't give email ─────
+  // ── 2. Body DSN patterns (second most reliable) ───────────
   if (!email) {
     const bodyPatterns = [
       /final-recipient:\s*rfc822;\s*([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})/i,
       /original-recipient:\s*rfc822;\s*([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})/i,
       /x-failed-recipients:\s*([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})/i,
+      /(?:the following address(?:es)? failed|failed recipient(?:s)?):[^@\n]*([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})/i,
       /(?:delivery to the following|failed to deliver to|undeliverable to|could not deliver to)\s+<?([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})>?/i,
-      /(?:to|recipient):\s*<?([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})>?/i,
-      /([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})/i,
+      /(?:original message recipient|to):\s+<?([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})>?/i,
     ];
     for (const p of bodyPatterns) {
       const m = text.match(p);
-      if (m?.[1] && !SKIP.some(s => m[1].toLowerCase().includes(s))) {
-        email = m[1].toLowerCase(); break;
+      if (m?.[1] && isValidRecipient(m[1])) {
+        email = m[1].toLowerCase();
+        console.log(`  → Email from body pattern: ${email}`);
+        break;
+      }
+    }
+  }
+
+  // ── 3. Last resort — any email in body that's not sender ──
+  if (!email) {
+    const allEmails = [...text.matchAll(/([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})/gi)];
+    for (const m of allEmails) {
+      if (isValidRecipient(m[1])) {
+        email = m[1].toLowerCase();
+        console.log(`  → Email from fallback scan: ${email}`);
+        break;
       }
     }
   }
