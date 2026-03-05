@@ -224,34 +224,96 @@ async function logEvent(e) {
 }
 
 // ═══════════════════════════════════════════════════════════
-//  SERVER-SIDE BOUNCE DETECTION
 // ═══════════════════════════════════════════════════════════
+//  SERVER-SIDE BOUNCE DETECTION — Instant + Scheduled
+// ═══════════════════════════════════════════════════════════
+
+// Run bounce check every 2 minutes automatically (no need for ping!)
+setInterval(() => {
+  checkAllBounces().catch(e => console.error('Interval bounce error:', e.message));
+}, 2 * 60 * 1000);
+
 async function checkBouncesForUser(userEmail) {
   const user = userStore[userEmail];
-  if (!user?.sheetId) return;
+  if (!user?.sheetId) { console.log(`⏭️ Skip ${userEmail} — no sheetId`); return; }
+
   const token = await getAccessToken(userEmail);
-  if (!token) return;
+  if (!token) { console.log(`⏭️ Skip ${userEmail} — no token`); return; }
+
+  if (!user.processedBounces) user.processedBounces = new Set();
+
   try {
-    const q = encodeURIComponent('(from:(mailer-daemon OR postmaster OR noreply) subject:(delivery OR undelivered OR bounce OR failed OR rejected OR returned OR "could not" OR "failure notice" OR "mail delivery")) newer_than:3d');
-    const res = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${q}&maxResults=30`,{headers:{Authorization:`Bearer ${token}`}});
-    if (!res.ok) return;
-    const data = await res.json();
-    if (!data.messages?.length) return;
-    if (!user.processedBounces) user.processedBounces = new Set();
-    console.log(`📧 ${userEmail}: ${data.messages.length} bounce emails to check`);
-    for (const msg of data.messages) {
+    // Try multiple queries — different mail servers use different senders
+    const queries = [
+      'from:mailer-daemon newer_than:7d',
+      'from:postmaster newer_than:7d',
+      'subject:"delivery status notification" newer_than:7d',
+      'subject:"undeliverable" newer_than:7d',
+      'subject:"mail delivery failed" newer_than:7d',
+      'subject:"failure notice" newer_than:7d',
+    ];
+
+    const seen = new Set();
+    const allMsgs = [];
+
+    for (const rawQ of queries) {
+      const q = encodeURIComponent(rawQ);
+      const res = await fetch(
+        `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${q}&maxResults=20`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (!res.ok) {
+        console.error(`❌ Gmail API ${res.status} for query: ${rawQ}`);
+        continue;
+      }
+      const data = await res.json();
+      for (const m of (data.messages || [])) {
+        if (!seen.has(m.id)) { seen.add(m.id); allMsgs.push(m); }
+      }
+    }
+
+    console.log(`📧 ${userEmail}: ${allMsgs.length} total bounce candidates`);
+    if (!allMsgs.length) return;
+
+    for (const msg of allMsgs) {
       if (user.processedBounces.has(msg.id)) continue;
-      const mr = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=full`,{headers:{Authorization:`Bearer ${token}`}});
-      if (!mr.ok) continue;
-      const md = await mr.json();
-      const body = getEmailBody(md.payload).slice(0,5000);
-      const info = parseBounce(body);
+
+      const mr = await fetch(
+        `https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=full`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (!mr.ok) { user.processedBounces.add(msg.id); continue; }
+
+      const md      = await mr.json();
+      const hdrs    = md.payload?.headers || [];
+      const subject = hdrs.find(h => h.name === 'Subject')?.value || '';
+      const fromHdr = hdrs.find(h => h.name === 'From')?.value || '';
+      const body    = getEmailBody(md.payload);
+      const full    = subject + ' ' + fromHdr + ' ' + body;
+
+      console.log(`  → Subject: "${subject.slice(0,80)}" | From: "${fromHdr.slice(0,50)}"`);
+
+      // Must look like a bounce
+      const looksLikeBounce =
+        /mailer.daemon|postmaster|mail.*delivery|delivery.*fail|undeliver|bounce|failure notice|returned mail/i.test(subject + fromHdr);
+      if (!looksLikeBounce) {
+        console.log(`  → Skipped (not a bounce)`);
+        user.processedBounces.add(msg.id);
+        continue;
+      }
+
+      const info = parseBounce(full, hdrs);
+      console.log(`  → Parsed: email="${info.email}" reason="${info.reason}" smtp=${info.smtpCode} enh=${info.enhCode}`);
+
       if (info.email) {
         console.log(`🔴 BOUNCE: ${info.email} — ${info.reason}`);
-        await updateStatus(user.sheetId, user.sheetTab||'Sheet1', info.email, 'EMAIL_BOUNCED');
-        await writeBounceReason(user.sheetId, user.sheetTab||'Sheet1', info.email, info.reason);
-        await logEvent({type:'EMAIL_BOUNCED',email:info.email,campaign:'bounce',url:info.reason});
+        await updateStatus(user.sheetId, user.sheetTab || 'Sheet1', info.email, 'EMAIL_BOUNCED');
+        await writeBounceReason(user.sheetId, user.sheetTab || 'Sheet1', info.email, info.reason);
+        await logEvent({ type:'EMAIL_BOUNCED', email:info.email, campaign:'bounce', url:info.reason });
+      } else {
+        console.log(`  → No email extracted — skipping`);
       }
+
       user.processedBounces.add(msg.id);
       await sleep(300);
     }
@@ -261,160 +323,184 @@ async function checkBouncesForUser(userEmail) {
 async function writeBounceReason(sheetId, tab, email, reason) {
   try {
     const sheets = await getSheets();
-    const r = await sheets.spreadsheets.values.get({spreadsheetId:sheetId,range:`${tab}!A1:Z500`});
-    const rows=(r.data.values||[]);
-    if (rows.length<2) return;
-    const h=rows[0].map(h=>(h||'').toLowerCase());
-    const ec=h.findIndex(h=>h.includes('email'));
-    let rc=h.findIndex(h=>h.includes('bounce reason'));
-    if (rc<0) {
-      rc=h.length;
-      await sheets.spreadsheets.values.update({spreadsheetId:sheetId,range:`${tab}!${toCol(rc+1)}1`,valueInputOption:'USER_ENTERED',requestBody:{values:[['Bounce Reason']]}});
+    const r = await sheets.spreadsheets.values.get({ spreadsheetId:sheetId, range:`${tab}!A1:Z500` });
+    const rows = r.data.values || [];
+    if (rows.length < 2) return;
+    const h  = rows[0].map(h => (h||'').toLowerCase());
+    const ec = h.findIndex(h => h.includes('email'));
+    let   rc = h.findIndex(h => h.includes('bounce reason'));
+    if (rc < 0) {
+      rc = h.length;
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: sheetId,
+        range: `${tab}!${toCol(rc+1)}1`,
+        valueInputOption: 'USER_ENTERED',
+        requestBody: { values: [['Bounce Reason']] }
+      });
     }
-    for (let i=1;i<rows.length;i++) {
-      if ((rows[i][ec]||'').toLowerCase().trim()===email.toLowerCase()) {
-        await sheets.spreadsheets.values.update({spreadsheetId:sheetId,range:`${tab}!${toCol(rc+1)}${i+1}`,valueInputOption:'USER_ENTERED',requestBody:{values:[[reason]]}});
+    for (let i = 1; i < rows.length; i++) {
+      if ((rows[i][ec]||'').toLowerCase().trim() === email.toLowerCase()) {
+        await sheets.spreadsheets.values.update({
+          spreadsheetId: sheetId,
+          range: `${tab}!${toCol(rc+1)}${i+1}`,
+          valueInputOption: 'USER_ENTERED',
+          requestBody: { values: [[reason]] }
+        });
         break;
       }
     }
-  } catch(e) {}
+  } catch(e) { console.error('writeBounceReason error:', e.message); }
 }
 
 function getEmailBody(payload) {
-  let t='';
-  function ex(p){if(p?.body?.data){try{t+=Buffer.from(p.body.data,'base64').toString('utf-8')+' ';}catch(e){}}if(p?.parts)p.parts.forEach(ex);}
-  ex(payload); return t;
+  let t = '';
+  function ex(p) {
+    if (p?.body?.data) {
+      try { t += Buffer.from(p.body.data, 'base64').toString('utf-8') + ' '; } catch(e) {}
+    }
+    if (p?.parts) p.parts.forEach(ex);
+  }
+  ex(payload);
+  return t.slice(0, 8000); // Enough context
 }
 
-function parseBounce(body) {
-  const b = body.toLowerCase();
+function parseBounce(text, headers = []) {
+  const b = text.toLowerCase();
 
-  // ── Extract bounced email address ─────────────────────────
+  // ── 1. Try DSN headers (most reliable source) ─────────────
   let email = '';
+  const SKIP = ['mailer-daemon','postmaster','noreply','no-reply','bounce','return','daemon'];
 
-  // Try DSN headers first (most reliable)
-  const dsnPatterns = [
-    /final-recipient:\s*rfc822;\s*([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})/i,
-    /original-recipient:\s*rfc822;\s*([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})/i,
-    /(?:failed to deliver(?:y)?|delivery has failed|undeliverable|could not be delivered)\s+(?:to\s+)?<?([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})>?/i,
-    /(?:the\s+following\s+(?:address|recipient)s?\s+(?:failed|could not))[^@]*([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})/i,
-    /(?:to|recipient):\s*<?([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})>?/i,
-    /([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})/i,
-  ];
-
-  const SKIP = ['mailer-daemon','postmaster','noreply','no-reply','bounce','return'];
-  for (const p of dsnPatterns) {
-    const m = body.match(p);
-    if (m?.[1]) {
-      const candidate = m[1].toLowerCase().trim();
-      if (!SKIP.some(s => candidate.includes(s))) {
-        email = candidate; break;
+  // Check email headers — X-Failed-Recipients is very reliable
+  const headerNames = ['x-failed-recipients','x-original-to','delivered-to','final-recipient'];
+  for (const hdr of headers) {
+    if (headerNames.includes(hdr.name?.toLowerCase())) {
+      const m = hdr.value?.match(/([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})/i);
+      if (m?.[1] && !SKIP.some(s => m[1].toLowerCase().includes(s))) {
+        email = m[1].toLowerCase(); break;
       }
     }
   }
 
-  // ── Extract SMTP status code ───────────────────────────────
-  const codeMatch = body.match(/(4\d\d|5\d\d)/);
-  const smtpCode  = codeMatch ? parseInt(codeMatch[1]) : 0;
+  // ── 2. Try body patterns if headers didn't give email ─────
+  if (!email) {
+    const bodyPatterns = [
+      /final-recipient:\s*rfc822;\s*([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})/i,
+      /original-recipient:\s*rfc822;\s*([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})/i,
+      /x-failed-recipients:\s*([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})/i,
+      /(?:delivery to the following|failed to deliver to|undeliverable to|could not deliver to)\s+<?([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})>?/i,
+      /(?:to|recipient):\s*<?([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})>?/i,
+      /([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})/i,
+    ];
+    for (const p of bodyPatterns) {
+      const m = text.match(p);
+      if (m?.[1] && !SKIP.some(s => m[1].toLowerCase().includes(s))) {
+        email = m[1].toLowerCase(); break;
+      }
+    }
+  }
 
-  // ── Extract enhanced status code (e.g. 5.1.1, 5.7.1) ─────
-  const enhMatch = body.match(/([45]\.\d+\.\d+)/);
-  const enhCode  = enhMatch ? enhMatch[1] : '';
+  // ── 3. SMTP + enhanced status codes ───────────────────────
+  const smtpMatch = b.match(/(4\d\d|5\d\d)/);
+  const smtpCode  = smtpMatch ? parseInt(smtpMatch[1]) : 0;
+  const enhMatch  = b.match(/([45]\.\d\.\d+)/);
+  const enhCode   = enhMatch ? enhMatch[1] : '';
 
-  // ── Detect reason (order matters — most specific first) ───
+  // ── 4. Reason detection ───────────────────────────────────
   let reason = 'Delivery Failed';
 
-  // Invalid / non-existent address
   if (
     b.includes('user unknown') || b.includes('no such user') ||
     b.includes('does not exist') || b.includes('invalid address') ||
-    b.includes('address rejected') || b.includes('bad destination') ||
-    b.includes('invalid recipient') || b.includes('recipient address rejected') ||
-    b.includes('no mailbox') || b.includes('unknown address') ||
-    b.includes('unknown user') || b.includes('address not found') ||
-    enhCode === '5.1.1' || enhCode === '5.1.2' || enhCode === '5.1.3'
+    b.includes('address rejected') || b.includes('invalid recipient') ||
+    b.includes('recipient address rejected') || b.includes('no mailbox') ||
+    b.includes('unknown address') || b.includes('unknown user') ||
+    b.includes('address not found') || b.includes('bad destination') ||
+    b.includes('not a valid') || b.includes('email address does not exist') ||
+    ['5.1.1','5.1.2','5.1.3'].includes(enhCode)
   ) reason = 'Invalid Address';
 
-  // Mailbox full / over quota
   else if (
     b.includes('mailbox full') || b.includes('over quota') ||
     b.includes('quota exceeded') || b.includes('storage full') ||
-    b.includes('insufficient storage') || b.includes('mailbox size') ||
-    enhCode === '4.2.2' || enhCode === '5.2.2'
+    b.includes('insufficient storage') || b.includes('mailbox size limit') ||
+    ['4.2.2','5.2.2'].includes(enhCode)
   ) reason = 'Mailbox Full';
 
-  // Account disabled / suspended / closed
   else if (
     b.includes('account disabled') || b.includes('account suspended') ||
-    b.includes('account closed') || b.includes('account has been') ||
-    b.includes('no longer active') || b.includes('deactivated') ||
-    b.includes('account inactive') || enhCode === '5.1.6'
+    b.includes('account closed') || b.includes('no longer active') ||
+    b.includes('deactivated') || b.includes('account inactive') ||
+    b.includes('disabled account') || enhCode === '5.1.6'
   ) reason = 'Account Disabled';
 
-  // Domain not found / DNS error
   else if (
     b.includes('domain not found') || b.includes('no such domain') ||
-    b.includes('host not found') || b.includes('dns') ||
-    b.includes('name or service not known') || b.includes('mx record') ||
+    b.includes('host not found') || b.includes('name or service not known') ||
     b.includes('could not find host') || b.includes('domain does not exist') ||
-    enhCode === '5.1.2' || enhCode === '5.4.4'
+    b.includes('no mx') || b.includes('dns lookup') ||
+    ['5.4.4','5.1.2'].includes(enhCode)
   ) reason = 'Domain Not Found';
 
-  // Spam / content blocked
   else if (
     b.includes('spam') || b.includes('spamhaus') || b.includes('spamcop') ||
-    b.includes('bulk mail') || b.includes('junk') || b.includes('ucе') ||
-    b.includes('content policy') || b.includes('message content') ||
-    b.includes('policy violation') || b.includes('abuse') ||
-    enhCode === '5.7.1' || enhCode === '5.7.9'
+    b.includes('bulk mail') || b.includes('content policy') ||
+    b.includes('policy violation') || b.includes('message considered spam') ||
+    ['5.7.1','5.7.9'].includes(enhCode)
   ) reason = 'Message Blocked (Spam)';
 
-  // Blacklisted IP / sender blocked
   else if (
     b.includes('blacklist') || b.includes('blocklist') ||
-    b.includes('blocked') || b.includes('sender blocked') ||
-    b.includes('ip blocked') || b.includes('sender reputation') ||
-    b.includes('dmarc') || b.includes('spf') || b.includes('dkim') ||
-    enhCode === '5.7.0' || enhCode === '5.7.26'
+    b.includes('sender blocked') || b.includes('ip blocked') ||
+    b.includes('sender reputation') || b.includes('dmarc') ||
+    b.includes('spf') || b.includes('dkim') ||
+    ['5.7.0','5.7.26','5.7.25'].includes(enhCode)
   ) reason = 'Sender Blocked';
 
-  // Rejected by server
   else if (
-    b.includes('rejected') || b.includes('permanently rejected') ||
-    b.includes('transaction failed') || smtpCode === 550 ||
-    smtpCode === 554 || smtpCode === 551
+    b.includes('message rejected') || b.includes('permanently rejected') ||
+    b.includes('transaction failed') || b.includes('rejected by') ||
+    smtpCode === 550 || smtpCode === 554 || smtpCode === 551 || smtpCode === 553
   ) reason = 'Message Rejected';
 
-  // Temporary failure (4xx)
-  else if (smtpCode >= 400 && smtpCode < 500) {
-    reason = 'Temporary Failure (Retry)';
-  }
-
-  // Generic relay/routing error
   else if (
-    b.includes('relay') || b.includes('routing') ||
-    b.includes('not permitted') || b.includes('not allowed')
+    b.includes('relay') || b.includes('not permitted') || b.includes('not allowed to relay')
   ) reason = 'Relay Denied';
+
+  else if (smtpCode >= 400 && smtpCode < 500) {
+    reason = 'Temporary Failure (Will Retry)';
+  }
 
   return { email, reason, smtpCode, enhCode };
 }
 
 async function checkAllBounces() {
-  const now=Date.now();
-  if (now-lastBounceCheck < 10*60*1000) return;
-  lastBounceCheck=now;
-  const users=Object.keys(userStore);
+  const users = Object.keys(userStore);
   if (!users.length) return;
   console.log(`🔍 Bounce check for ${users.length} users`);
-  for (const u of users){await checkBouncesForUser(u);await sleep(500);}
+  lastBounceCheck = Date.now();
+  for (const u of users) {
+    await checkBouncesForUser(u);
+    await sleep(500);
+  }
 }
 
-// ═══════════════════════════════════════════════════════════
 //  ROUTES
 // ═══════════════════════════════════════════════════════════
 app.get('/ping', async (req,res) => {
   res.json({status:'alive',time:new Date(),users:Object.keys(userStore).length});
   checkAllBounces().catch(()=>{});
+});
+
+// 🔍 Manual bounce check endpoint — for testing
+app.get('/bounce-check', async (req,res) => {
+  if (req.query.key !== process.env.DASHBOARD_KEY) return res.status(401).json({error:'Unauthorized'});
+  const users = Object.keys(userStore);
+  res.json({ message:`Checking ${users.length} users...`, users });
+  for (const u of users) {
+    await checkBouncesForUser(u);
+    await sleep(500);
+  }
 });
 
 app.get('/track/open', async (req,res) => {
