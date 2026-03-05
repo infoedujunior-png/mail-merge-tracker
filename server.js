@@ -341,7 +341,7 @@ async function checkBouncesForUser(userEmail) {
         continue;
       }
 
-      const info = parseBounce(full, hdrs, userEmail); // ✅ Pass sender to exclude it
+      const info = parseBounce(full, hdrs, userEmail, md.payload); // ✅ Pass payload for DSN parsing
       console.log(`  → Parsed: email="${info.email}" reason="${info.reason}" smtp=${info.smtpCode} enh=${info.enhCode}`);
 
       if (info.email) {
@@ -395,150 +395,157 @@ function getEmailBody(payload) {
   let t = '';
   function ex(p) {
     if (p?.body?.data) {
-      try { t += Buffer.from(p.body.data, 'base64').toString('utf-8') + ' '; } catch(e) {}
+      try { t += Buffer.from(p.body.data, 'base64').toString('utf-8') + '\n'; } catch(e) {}
     }
     if (p?.parts) p.parts.forEach(ex);
   }
   ex(payload);
-  return t.slice(0, 8000); // Enough context
+  return t.slice(0, 10000);
 }
 
-function parseBounce(text, headers = [], senderEmail = '') {
-  const b = text.toLowerCase();
+// ✅ Extract DSN delivery-status part specifically (most reliable!)
+function getDsnPart(payload) {
+  let dsn = '';
+  function ex(p) {
+    if (p?.mimeType === 'message/delivery-status' && p?.body?.data) {
+      try { dsn = Buffer.from(p.body.data, 'base64').toString('utf-8'); } catch(e) {}
+    }
+    if (p?.parts) p.parts.forEach(ex);
+  }
+  ex(payload);
+  return dsn;
+}
 
-  // ── 1. Try DSN headers (most reliable source) ─────────────
+function parseBounce(text, headers = [], senderEmail = '', payload = null) {
   let email = '';
-  // Always skip sender email + common system addresses
   const senderLower = (senderEmail || '').toLowerCase();
-  const SKIP = ['mailer-daemon','postmaster','noreply','no-reply','bounce','return','daemon'];
 
-  function isValidRecipient(addr) {
-    const a = addr.toLowerCase().trim();
-    if (!a || !a.includes('@')) return false;
-    if (SKIP.some(s => a.includes(s))) return false;
-    if (senderLower && a === senderLower) return false; // ✅ Exclude sender!
+  function isValid(addr) {
+    const a = (addr || '').toLowerCase().trim();
+    if (!a || !a.includes('@') || !a.includes('.')) return false;
+    if (a === senderLower) return false;
+    if (/mailer.daemon|postmaster|noreply|no.reply|bounce|return|daemon/i.test(a)) return false;
     return true;
   }
 
-  // ── 1. DSN Headers first (most reliable) ──────────────────
-  // X-Failed-Recipients is the BEST source — explicitly lists failed address
-  const priorityHeaders = ['x-failed-recipients', 'x-original-to', 'final-recipient', 'original-recipient'];
-  for (const hdr of headers) {
-    if (priorityHeaders.includes(hdr.name?.toLowerCase())) {
-      const m = hdr.value?.match(/([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})/i);
-      if (m?.[1] && isValidRecipient(m[1])) {
-        email = m[1].toLowerCase();
-        console.log(`  → Email from header "${hdr.name}": ${email}`);
-        break;
+  // ── STEP 1: Parse DSN MIME part (most reliable for Gmail bounces) ──
+  const dsn = payload ? getDsnPart(payload) : '';
+  if (dsn) {
+    const finalMatch = dsn.match(/Final-Recipient:\s*rfc822;\s*([^\s\r\n]+)/i);
+    if (finalMatch?.[1] && isValid(finalMatch[1])) {
+      email = finalMatch[1].replace(/[<>]/g, '').toLowerCase();
+      console.log(`  → DSN Final-Recipient: ${email}`);
+    }
+    if (!email) {
+      const origMatch = dsn.match(/Original-Recipient:\s*rfc822;\s*([^\s\r\n]+)/i);
+      if (origMatch?.[1] && isValid(origMatch[1])) {
+        email = origMatch[1].replace(/[<>]/g, '').toLowerCase();
+        console.log(`  → DSN Original-Recipient: ${email}`);
       }
     }
   }
 
-  // ── 2. Body DSN patterns (second most reliable) ───────────
+  // ── STEP 2: Check email headers ────────────────────────────
   if (!email) {
-    const bodyPatterns = [
-      /final-recipient:\s*rfc822;\s*([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})/i,
-      /original-recipient:\s*rfc822;\s*([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})/i,
-      /x-failed-recipients:\s*([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})/i,
-      /(?:the following address(?:es)? failed|failed recipient(?:s)?):[^@\n]*([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})/i,
-      /(?:delivery to the following|failed to deliver to|undeliverable to|could not deliver to)\s+<?([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})>?/i,
-      /(?:original message recipient|to):\s+<?([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})>?/i,
+    for (const hdr of headers) {
+      const name = (hdr.name || '').toLowerCase();
+      if (['x-failed-recipients','x-original-to'].includes(name)) {
+        const m = hdr.value?.match(/([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})/);
+        if (m?.[1] && isValid(m[1])) {
+          email = m[1].toLowerCase();
+          console.log(`  → Header "${hdr.name}": ${email}`);
+          break;
+        }
+      }
+    }
+  }
+
+  // ── STEP 3: DSN patterns in body text ─────────────────────
+  if (!email) {
+    const patterns = [
+      /Final-Recipient:\s*rfc822;\s*([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})/i,
+      /Original-Recipient:\s*rfc822;\s*([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})/i,
+      /X-Failed-Recipients:\s*([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})/i,
+      /(?:failed to deliver|could not deliver|undeliverable|delivery failed)[^@\n]{0,80}?([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})/i,
+      /(?:the following address|the following recipient)[^@\n]{0,80}?([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})/i,
     ];
-    for (const p of bodyPatterns) {
+    for (const p of patterns) {
       const m = text.match(p);
-      if (m?.[1] && isValidRecipient(m[1])) {
+      if (m?.[1] && isValid(m[1])) {
         email = m[1].toLowerCase();
-        console.log(`  → Email from body pattern: ${email}`);
+        console.log(`  → Body pattern: ${email}`);
         break;
       }
     }
   }
 
-  // ── 3. Last resort — any email in body that's not sender ──
+  // ── STEP 4: Scan all emails, pick first non-sender ────────
   if (!email) {
-    const allEmails = [...text.matchAll(/([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})/gi)];
-    for (const m of allEmails) {
-      if (isValidRecipient(m[1])) {
+    const all = [...text.matchAll(/([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})/g)];
+    for (const m of all) {
+      if (isValid(m[1])) {
         email = m[1].toLowerCase();
-        console.log(`  → Email from fallback scan: ${email}`);
+        console.log(`  → Fallback scan: ${email}`);
         break;
       }
     }
   }
 
-  // ── 3. SMTP + enhanced status codes ───────────────────────
-  const smtpMatch = b.match(/(4\d\d|5\d\d)/);
+  // ── SMTP + Enhanced status codes ──────────────────────────
+  const smtpMatch = text.match(/\b(5\d\d|4\d\d)\b/);
   const smtpCode  = smtpMatch ? parseInt(smtpMatch[1]) : 0;
-  const enhMatch  = b.match(/([45]\.\d\.\d+)/);
+  const enhMatch  = text.match(/\b([45]\.\d\.\d+)\b/);
   const enhCode   = enhMatch ? enhMatch[1] : '';
 
-  // ── 4. Reason detection ───────────────────────────────────
+  // Also get Status from DSN
+  let dsnStatus = '';
+  if (dsn) {
+    const sm = dsn.match(/Status:\s*([45]\.\d+\.\d+)/i);
+    if (sm) dsnStatus = sm[1];
+  }
+  const effectiveEnh = dsnStatus || enhCode;
+
+  const b = text.toLowerCase();
   let reason = 'Delivery Failed';
 
-  if (
-    b.includes('user unknown') || b.includes('no such user') ||
-    b.includes('does not exist') || b.includes('invalid address') ||
-    b.includes('address rejected') || b.includes('invalid recipient') ||
-    b.includes('recipient address rejected') || b.includes('no mailbox') ||
-    b.includes('unknown address') || b.includes('unknown user') ||
-    b.includes('address not found') || b.includes('bad destination') ||
-    b.includes('not a valid') || b.includes('email address does not exist') ||
-    ['5.1.1','5.1.2','5.1.3'].includes(enhCode)
-  ) reason = 'Invalid Address';
-
-  else if (
-    b.includes('mailbox full') || b.includes('over quota') ||
-    b.includes('quota exceeded') || b.includes('storage full') ||
-    b.includes('insufficient storage') || b.includes('mailbox size limit') ||
-    ['4.2.2','5.2.2'].includes(enhCode)
-  ) reason = 'Mailbox Full';
-
-  else if (
-    b.includes('account disabled') || b.includes('account suspended') ||
-    b.includes('account closed') || b.includes('no longer active') ||
-    b.includes('deactivated') || b.includes('account inactive') ||
-    b.includes('disabled account') || enhCode === '5.1.6'
-  ) reason = 'Account Disabled';
-
-  else if (
-    b.includes('domain not found') || b.includes('no such domain') ||
-    b.includes('host not found') || b.includes('name or service not known') ||
-    b.includes('could not find host') || b.includes('domain does not exist') ||
-    b.includes('no mx') || b.includes('dns lookup') ||
-    ['5.4.4','5.1.2'].includes(enhCode)
-  ) reason = 'Domain Not Found';
-
-  else if (
-    b.includes('spam') || b.includes('spamhaus') || b.includes('spamcop') ||
-    b.includes('bulk mail') || b.includes('content policy') ||
-    b.includes('policy violation') || b.includes('message considered spam') ||
-    ['5.7.1','5.7.9'].includes(enhCode)
-  ) reason = 'Message Blocked (Spam)';
-
-  else if (
-    b.includes('blacklist') || b.includes('blocklist') ||
-    b.includes('sender blocked') || b.includes('ip blocked') ||
-    b.includes('sender reputation') || b.includes('dmarc') ||
-    b.includes('spf') || b.includes('dkim') ||
-    ['5.7.0','5.7.26','5.7.25'].includes(enhCode)
-  ) reason = 'Sender Blocked';
-
-  else if (
-    b.includes('message rejected') || b.includes('permanently rejected') ||
-    b.includes('transaction failed') || b.includes('rejected by') ||
-    smtpCode === 550 || smtpCode === 554 || smtpCode === 551 || smtpCode === 553
-  ) reason = 'Message Rejected';
-
-  else if (
-    b.includes('relay') || b.includes('not permitted') || b.includes('not allowed to relay')
-  ) reason = 'Relay Denied';
-
-  else if (smtpCode >= 400 && smtpCode < 500) {
+  if (['5.1.1','5.1.2','5.1.3'].includes(effectiveEnh) ||
+      b.includes('user unknown') || b.includes('no such user') ||
+      b.includes('does not exist') || b.includes('invalid address') ||
+      b.includes('address rejected') || b.includes('unknown user') ||
+      b.includes('no mailbox') || b.includes('recipient not found')) {
+    reason = 'Invalid Address';
+  } else if (['4.2.2','5.2.2'].includes(effectiveEnh) ||
+      b.includes('mailbox full') || b.includes('over quota') ||
+      b.includes('quota exceeded') || b.includes('storage full')) {
+    reason = 'Mailbox Full';
+  } else if (effectiveEnh === '5.1.6' ||
+      b.includes('account disabled') || b.includes('account suspended') ||
+      b.includes('no longer active') || b.includes('deactivated')) {
+    reason = 'Account Disabled';
+  } else if (['5.4.4'].includes(effectiveEnh) ||
+      b.includes('domain not found') || b.includes('no such domain') ||
+      b.includes('dns') || b.includes('host not found')) {
+    reason = 'Domain Not Found';
+  } else if (['5.7.1','5.7.9'].includes(effectiveEnh) ||
+      b.includes('spam') || b.includes('policy violation') ||
+      b.includes('content rejected')) {
+    reason = 'Message Blocked (Spam)';
+  } else if (['5.7.0','5.7.26'].includes(effectiveEnh) ||
+      b.includes('dmarc') || b.includes('spf') || b.includes('dkim') ||
+      b.includes('blacklist') || b.includes('sender blocked')) {
+    reason = 'Sender Blocked';
+  } else if (smtpCode === 550 || smtpCode === 554 || smtpCode === 551 ||
+      b.includes('rejected') || b.includes('permanently rejected')) {
+    reason = 'Message Rejected';
+  } else if (smtpCode >= 400 && smtpCode < 500) {
     reason = 'Temporary Failure (Will Retry)';
+  } else if (b.includes('relay') || b.includes('not permitted')) {
+    reason = 'Relay Denied';
   }
 
-  return { email, reason, smtpCode, enhCode };
+  return { email, reason, smtpCode, enhCode: effectiveEnh };
 }
+
 
 async function checkAllBounces() {
   const users = Object.keys(userStore);
