@@ -614,6 +614,36 @@ app.post('/auth/save-token', async (req,res) => {
   } catch(e){console.error('save-token:',e.message);res.status(500).json({error:e.message});}
 });
 
+// ✅ Auto restore session — called every time extension opens
+// No sign out/in needed — just refreshes access token in memory!
+app.post('/auth/restore-session', async (req, res) => {
+  const { userEmail, accessToken, sheetId, sheetTab } = req.body;
+  if (!userEmail) return res.status(400).json({ error: 'Missing userEmail' });
+
+  if (userStore[userEmail]) {
+    // User exists — just update access token + sheet info
+    userStore[userEmail].accessToken = accessToken;
+    if (sheetId)  userStore[userEmail].sheetId  = sheetId;
+    if (sheetTab) userStore[userEmail].sheetTab = sheetTab;
+    saveUserStore();
+    console.log(`🔄 Session restored for ${userEmail}`);
+    return res.json({ restored: true, hasRefreshToken: !!userStore[userEmail].refreshToken });
+  } else {
+    // User not in store (fresh server start + no file) — need refresh token
+    // Save access token at least so bounce check works for now
+    userStore[userEmail] = {
+      refreshToken: null,
+      accessToken,
+      sheetId:  sheetId  || '',
+      sheetTab: sheetTab || 'Sheet1',
+      savedAt:  new Date().toISOString(),
+    };
+    saveUserStore();
+    console.log(`⚠️ New session for ${userEmail} — no refresh token yet`);
+    return res.json({ restored: false, needsReauth: true });
+  }
+});
+
 app.post('/auth/update-sheet',(req,res)=>{
   const{userEmail,sheetId,sheetTab}=req.body;
   if(userEmail){
