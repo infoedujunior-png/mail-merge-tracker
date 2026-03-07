@@ -17,8 +17,153 @@ app.use(express.json({ limit: '10mb' }));
 const PIXEL = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7','base64');
 
 const trackingStore = {};
-const scheduleStore = {};
+let scheduleStore   = {}; // Will be loaded from file after helper functions defined
 let lastBounceCheck = 0;
+
+// ══════════════════════════════════════════════════════════
+//  RESTORE PENDING JOBS after restart
+// ══════════════════════════════════════════════════════════
+function restorePendingJobs() {
+  const jobs = Object.values(scheduleStore).filter(j => j.status === 'pending');
+  if (!jobs.length) { console.log('📅 No pending jobs to restore'); return; }
+  console.log(`📅 Restoring ${jobs.length} pending jobs...`);
+
+  for (const job of jobs) {
+    const delay = new Date(job.scheduledAt).getTime() - Date.now();
+
+    if (delay < -5 * 60 * 1000) {
+      // Job is more than 5 min overdue — run immediately
+      console.log(`⚡ Overdue job ${job.id} — running immediately`);
+      scheduleStore[job.id].status = 'running';
+      saveScheduleStore();
+      executeScheduledJob(job).then(sent => {
+        scheduleStore[job.id].status = 'done';
+        scheduleStore[job.id].sent = sent;
+        if (job.userEmail) addEmailCount(job.userEmail, sent);
+        saveScheduleStore();
+        console.log(`✅ Overdue job ${job.id} done: ${sent} sent`);
+      }).catch(e => {
+        scheduleStore[job.id].status = 'failed';
+        scheduleStore[job.id].error = e.message;
+        saveScheduleStore();
+        console.log(`❌ Overdue job ${job.id} failed: ${e.message}`);
+      });
+    } else if (delay <= 0) {
+      // Just overdue — run now
+      setImmediate(() => fireJob(job.id));
+    } else {
+      // Future job — reschedule
+      console.log(`⏰ Re-scheduling job ${job.id} in ${Math.round(delay/60000)} min`);
+      setTimeout(() => fireJob(job.id), delay);
+    }
+  }
+}
+
+async function fireJob(id) {
+  const job = scheduleStore[id];
+  if (!job || job.status !== 'pending') return;
+  console.log(`🚀 FIRING JOB ${id}`);
+  scheduleStore[id].status = 'running';
+  saveScheduleStore();
+  try {
+    const sent = await executeScheduledJob(job);
+    scheduleStore[id].status = 'done';
+    scheduleStore[id].sent   = sent;
+    if (job.userEmail) addEmailCount(job.userEmail, sent);
+    saveScheduleStore();
+    console.log(`✅ Job ${id} done: ${sent}/${job.recipients?.length} sent`);
+  } catch(e) {
+    scheduleStore[id].status = 'failed';
+    scheduleStore[id].error  = e.message;
+    saveScheduleStore();
+    console.error(`❌ Job ${id} failed: ${e.message}`);
+  }
+}
+
+// ══════════════════════════════════════════════════════════
+//  MONETIZATION SYSTEM
+// ══════════════════════════════════════════════════════════
+const PLANS = {
+  free:   { dailyLimit: 25,  name: 'Free',       price: 0    },
+  paid:   { dailyLimit: 400, name: 'Pro',         price: 299  }, // ₹299/month
+  intern: { dailyLimit: 400, name: 'Team (Free)', price: 0    }, // Admin grants free
+};
+
+const PLANS_FILE = path.join('/tmp', 'edujunior_plans.json');
+let planStore = {}; // { email: { plan, expiresAt, razorpaySubId, addedBy, addedAt } }
+
+function loadPlanStore() {
+  try {
+    if (fs.existsSync(PLANS_FILE)) {
+      const d = JSON.parse(fs.readFileSync(PLANS_FILE, 'utf8'));
+      console.log(`📂 Loaded ${Object.keys(d).length} user plans from disk`);
+      return d;
+    }
+  } catch(e) { console.error('Load plans error:', e.message); }
+  return {};
+}
+
+function savePlanStore() {
+  try {
+    fs.writeFileSync(PLANS_FILE, JSON.stringify(planStore, null, 2));
+  } catch(e) { console.error('Save plans error:', e.message); }
+}
+
+planStore = loadPlanStore();
+
+// Daily email count tracking (resets at midnight IST)
+const dailyCountFile = path.join('/tmp', 'edujunior_counts.json');
+let dailyCounts = {}; // { email: { count, date } }
+
+function loadDailyCounts() {
+  try {
+    if (fs.existsSync(dailyCountFile)) return JSON.parse(fs.readFileSync(dailyCountFile, 'utf8'));
+  } catch(e) {}
+  return {};
+}
+function saveDailyCounts() {
+  try { fs.writeFileSync(dailyCountFile, JSON.stringify(dailyCounts, null, 2)); } catch(e) {}
+}
+dailyCounts = loadDailyCounts();
+
+function getTodayIST() {
+  return new Date().toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' });
+}
+
+function getUserPlan(email) {
+  const e = (email || '').toLowerCase();
+  const p = planStore[e];
+  if (!p) return 'free';
+  // Check if paid plan expired
+  if (p.plan === 'paid' && p.expiresAt && new Date(p.expiresAt) < new Date()) return 'free';
+  return p.plan || 'free';
+}
+
+function getDailyUsage(email) {
+  const e = (email || '').toLowerCase();
+  const today = getTodayIST();
+  if (!dailyCounts[e] || dailyCounts[e].date !== today) {
+    dailyCounts[e] = { count: 0, date: today };
+  }
+  return dailyCounts[e].count;
+}
+
+function getRemainingEmails(email) {
+  const plan    = getUserPlan(email);
+  const limit   = PLANS[plan]?.dailyLimit || 25;
+  const used    = getDailyUsage(email);
+  return Math.max(0, limit - used);
+}
+
+function addEmailCount(email, count = 1) {
+  const e = (email || '').toLowerCase();
+  const today = getTodayIST();
+  if (!dailyCounts[e] || dailyCounts[e].date !== today) {
+    dailyCounts[e] = { count: 0, date: today };
+  }
+  dailyCounts[e].count += count;
+  saveDailyCounts();
+}
 
 // ══════════════════════════════════════════════════════════
 //  PERSISTENT TOKEN STORAGE — survives Render restarts! ✅
@@ -56,6 +201,29 @@ function saveUserStore() {
 
 // Load on startup
 const userStore = loadUserStore();
+
+// ══════════════════════════════════════════════════════════
+//  PERSISTENT SCHEDULE STORAGE — survives Render restarts!
+// ══════════════════════════════════════════════════════════
+const SCHEDULE_FILE = path.join('/tmp', 'edujunior_schedule.json');
+
+function loadScheduleStore() {
+  try {
+    if (fs.existsSync(SCHEDULE_FILE)) {
+      const data = JSON.parse(fs.readFileSync(SCHEDULE_FILE, 'utf8'));
+      const pending = Object.values(data).filter(j => j.status === 'pending');
+      console.log(`📂 Loaded ${Object.keys(data).length} jobs (${pending.length} pending)`);
+      return data;
+    }
+  } catch(e) { console.error('Load schedule error:', e.message); }
+  return {};
+}
+
+function saveScheduleStore() {
+  try {
+    fs.writeFileSync(SCHEDULE_FILE, JSON.stringify(scheduleStore, null, 2));
+  } catch(e) { console.error('Save schedule error:', e.message); }
+}
 
 // ── Service Account Sheets ─────────────────────────────────
 async function getSheets() {
@@ -277,7 +445,7 @@ async function checkBouncesForUser(userEmail) {
   if (!user?.sheetId) { console.log(`⏭️ Skip ${userEmail} — no sheetId`); return; }
 
   const token = await getAccessToken(userEmail);
-  if (!token) { console.log(`⏭️ Skip ${userEmail} — no token`); return; }
+  if (!token) { console.log(`⏭️ Skip ${userEmail} — no token (open extension to refresh)`); return; }
 
   if (!user.processedBounces) user.processedBounces = new Set();
 
@@ -633,11 +801,12 @@ app.post('/auth/restore-session', async (req, res) => {
     if (sheetId)  userStore[userEmail].sheetId  = sheetId;
     if (sheetTab) userStore[userEmail].sheetTab = sheetTab;
     saveUserStore();
-    console.log(`🔄 Session restored for ${userEmail}`);
+    console.log(`🔄 Session restored for ${userEmail} | sheetId: ${userStore[userEmail].sheetId || 'none'}`);
+    // Trigger bounce check immediately with fresh token!
+    checkBouncesForUser(userEmail).catch(e => console.error('Bounce after restore:', e.message));
     return res.json({ restored: true, hasRefreshToken: !!userStore[userEmail].refreshToken });
   } else {
-    // User not in store (fresh server start + no file) — need refresh token
-    // Save access token at least so bounce check works for now
+    // New user — save access token, bounce check will use it
     userStore[userEmail] = {
       refreshToken: null,
       accessToken,
@@ -646,8 +815,10 @@ app.post('/auth/restore-session', async (req, res) => {
       savedAt:  new Date().toISOString(),
     };
     saveUserStore();
-    console.log(`⚠️ New session for ${userEmail} — no refresh token yet`);
-    return res.json({ restored: false, needsReauth: true });
+    console.log(`✅ Session created for ${userEmail} | sheetId: ${sheetId || 'none'}`);
+    // Trigger bounce check immediately!
+    if (sheetId) checkBouncesForUser(userEmail).catch(e => console.error('Bounce on new session:', e.message));
+    return res.json({ restored: true, hasRefreshToken: false });
   }
 });
 
@@ -663,70 +834,65 @@ app.post('/auth/update-sheet',(req,res)=>{
   res.json({success:true});
 });
 
-// ✅ SCHEDULING — 24/7 even Chrome closed!
+// ✅ SCHEDULING — Persistent! Survives Render restarts!
 app.post('/schedule', async (req,res) => {
   try {
-    const{scheduleId,scheduledAt,recipients,draftSubject,draftHtml,sender,sheetId,sheetTab,userEmail,token}=req.body;
-    if(!scheduledAt||!recipients||!draftHtml)return res.status(400).json({error:'Missing fields'});
-    const delay=new Date(scheduledAt).getTime()-Date.now();
-    if(delay<0)return res.status(400).json({error:'Past time'});
-    const id=scheduleId||('job_'+Date.now());
-    scheduleStore[id]={status:'pending',scheduledAt,recipients,sender,sheetId,sheetTab,userEmail};
-    if(userEmail&&token&&userStore[userEmail])userStore[userEmail].accessToken=token;
-    else if(userEmail&&token)userStore[userEmail]={accessToken:token,sheetId,sheetTab:sheetTab||'Sheet1'};
-    console.log(`📅 Job ${id} — ${recipients.length} emails at ${scheduledAt} for ${userEmail}`);
+    const {scheduleId,scheduledAt,recipients,draftSubject,draftHtml,
+           sender,sheetId,sheetTab,userEmail,token} = req.body;
+    if (!scheduledAt||!recipients||!draftHtml)
+      return res.status(400).json({error:'Missing fields'});
 
-    setTimeout(async()=>{
-      console.log(`🚀 RUNNING JOB ${id}`);
-      scheduleStore[id].status='running';
-      let sent=0;
-
-      // Get fresh token via refresh token!
-      let activeToken=token;
-      if(userEmail){
-        const fresh=await getAccessToken(userEmail);
-        if(fresh){activeToken=fresh;console.log(`✅ Fresh token for ${userEmail}`);}
-        else console.log(`⚠️ No refresh token — using original`);
+    // Check limit
+    if (userEmail) {
+      const remaining = getRemainingEmails(userEmail);
+      if (recipients.length > remaining) {
+        const plan  = getUserPlan(userEmail);
+        const limit = PLANS[plan]?.dailyLimit || 25;
+        return res.status(403).json({
+          error:'limit_exceeded', plan, limit,
+          used: getDailyUsage(userEmail), remaining,
+          message: remaining === 0
+            ? 'Daily limit reached! Upgrade to Pro for 400 emails/day.'
+            : `Only ${remaining} emails left today.`
+        });
       }
-      if(!activeToken){scheduleStore[id].status='failed';console.log('❌ No token!');return;}
+    }
 
-      const serverUrl='https://mail-merge-tracker.onrender.com';
-      const camp=encodeURIComponent((draftSubject||'sched')+'_'+Date.now());
-      const sid=encodeURIComponent(sheetId||'');
-      const stab=encodeURIComponent(sheetTab||'Sheet1');
+    const delay = new Date(scheduledAt).getTime() - Date.now();
+    if (delay < -60000) return res.status(400).json({error:'Past time'});
 
-      function wrapHtml(raw){
-        if(!raw.toLowerCase().includes('<html'))return`<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body>${raw}</body></html>`;
-        if(!raw.toLowerCase().includes('</body>'))return raw+'</body></html>';
-        return raw;
-      }
+    const id = scheduleId || ('job_' + Date.now());
 
-      for(const r of recipients){
-        try{
-          let html=(draftHtml||'').replace(/\{\{(\w[\w\s]*)\}\}/g,(m,k)=>r[k.trim().toLowerCase()]||r[k.trim()]||m);
-          let subject=(draftSubject||'').replace(/\{\{(\w[\w\s]*)\}\}/g,(m,k)=>r[k.trim().toLowerCase()]||r[k.trim()]||m);
-          html=wrapHtml(html);
-          const enc=encodeURIComponent(r.email);
-          html=html.replace('</body>',`<img src="${serverUrl}/track/open?email=${enc}&campaign=${camp}&sheetId=${sid}&tab=${stab}" width="1" height="1" style="display:none" alt=""/></body>`);
-          html=html.replace(/href="(https?:\/\/[^"]+)"/gi,(m,orig)=>orig.includes(serverUrl)?m:`href="${serverUrl}/track/click?email=${enc}&campaign=${camp}&sheetId=${sid}&tab=${stab}&url=${encodeURIComponent(orig)}"`);
-          const unsubUrl=`${serverUrl}/unsubscribe?email=${enc}&campaign=${camp}&sheetId=${sid}&tab=${stab}`;
-          html=html.replace('</body>',`<div style="margin-top:28px;padding-top:14px;border-top:1px solid #e8eaed;text-align:center;font-family:Arial,sans-serif;font-size:11px;color:#9aa0a6;"><a href="${unsubUrl}" style="color:#9aa0a6;">Unsubscribe</a></div></body>`);
-          const boundary='mm_'+Math.random().toString(36).slice(2);
-          const raw=[`From: ${sender}`,`To: ${r.email}`,`Subject: ${subject}`,`MIME-Version: 1.0`,`Content-Type: multipart/alternative; boundary="${boundary}"`,``,`--${boundary}`,`Content-Type: text/html; charset=UTF-8`,``,html,``,`--${boundary}--`].join('\r\n');
-          const encoded=Buffer.from(raw).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
-          const sr=await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send',{method:'POST',headers:{Authorization:`Bearer ${activeToken}`,'Content-Type':'application/json'},body:JSON.stringify({raw:encoded})});
-          console.log(`📤 ${r.email}: ${sr.status}`);
-          if(sr.ok){sent++;if(sheetId)await updateStatusUserToken(activeToken,sheetId,sheetTab||'Sheet1',r.email,'EMAIL_SENT');}
-          else{const e=await sr.text();console.log(`❌ ${e.slice(0,100)}`);}
-        }catch(e){console.error(`Error ${r.email}:`,e.message);}
-        await sleep(400);
-      }
-      scheduleStore[id].status='done';scheduleStore[id].sent=sent;
-      console.log(`✅ Job ${id} DONE: ${sent}/${recipients.length}`);
-    },delay);
+    // Save token
+    if (userEmail && token) {
+      if (!userStore[userEmail]) userStore[userEmail] = { sheetId, sheetTab: sheetTab||'Sheet1' };
+      userStore[userEmail].accessToken = token;
+      saveUserStore();
+    }
 
-    res.json({success:true,id,message:`Scheduled! ${recipients.length} emails at ${new Date(scheduledAt).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})} IST`});
-  }catch(e){console.error('schedule error:',e.message);res.status(500).json({error:e.message});}
+    // ✅ Save job to DISK — survives restarts!
+    scheduleStore[id] = {
+      id, status:'pending', scheduledAt,
+      recipients, draftSubject, draftHtml,
+      sender, sheetId, sheetTab: sheetTab||'Sheet1',
+      userEmail, createdAt: new Date().toISOString()
+    };
+    saveScheduleStore();
+
+    console.log(`📅 Job ${id} saved to disk — ${recipients.length} emails at ${scheduledAt}`);
+
+    // Fire after delay
+    const actualDelay = Math.max(0, delay);
+    setTimeout(() => fireJob(id), actualDelay);
+
+    res.json({
+      success:true, id,
+      message:`Scheduled! ${recipients.length} emails at ${new Date(scheduledAt).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})} IST`
+    });
+  } catch(e) {
+    console.error('schedule error:', e.message);
+    res.status(500).json({error:e.message});
+  }
 });
 
 app.get('/schedule/:id',(req,res)=>{const j=scheduleStore[req.params.id];if(!j)return res.status(404).json({error:'Not found'});res.json({status:j.status,sent:j.sent,total:j.recipients?.length});});
@@ -750,6 +916,403 @@ app.get('/dashboard', async (req,res) => {
   }catch(e){res.status(500).send('Error: '+e.message);}
 });
 
-app.get('/',(req,res)=>res.json({status:'✅ EduJunior v5',users:Object.keys(userStore).length,time:new Date()}));
-const PORT=process.env.PORT||3000;
-app.listen(PORT,()=>console.log(`✅ EduJunior Tracker v5 on port ${PORT}`));
+// ─── User Status (called by extension) ────────────────────
+app.get('/user/status', (req, res) => {
+  const email = (req.query.email || '').toLowerCase();
+  if (!email) return res.status(400).json({ error: 'Missing email' });
+  const plan      = getUserPlan(email);
+  const limit     = PLANS[plan]?.dailyLimit || 25;
+  const used      = getDailyUsage(email);
+  const remaining = Math.max(0, limit - used);
+  res.json({ plan, planName: PLANS[plan]?.name || 'Free', limit, used, remaining, email });
+});
+
+// ─── Check limit before normal (non-scheduled) send ──────
+app.post('/user/check-limit', (req, res) => {
+  const { email, count } = req.body;
+  if (!email) return res.status(400).json({ error: 'Missing email' });
+  const remaining = getRemainingEmails(email);
+  const plan      = getUserPlan(email);
+  const limit     = PLANS[plan]?.dailyLimit || 25;
+  if ((count || 1) > remaining) {
+    return res.json({
+      allowed: false, plan, limit, used: getDailyUsage(email), remaining,
+      message: remaining === 0
+        ? 'Daily limit reached! Upgrade to Pro for 400 emails/day.'
+        : `Only ${remaining} emails left today.`
+    });
+  }
+  res.json({ allowed: true, plan, limit, used: getDailyUsage(email), remaining });
+});
+
+// ─── Track send count (called after normal send) ──────────
+app.post('/user/track-send', (req, res) => {
+  const { email, count } = req.body;
+  if (email) addEmailCount(email, count || 1);
+  res.json({ success: true });
+});
+
+// ─── Razorpay — Create Order ──────────────────────────────
+app.post('/payment/create-order', async (req, res) => {
+  const { email, months } = req.body;
+  if (!email) return res.status(400).json({ error: 'Missing email' });
+  const m      = parseInt(months) || 1;
+  const amount = PLANS.paid.price * m * 100; // Razorpay uses paise
+  try {
+    const response = await fetch('https://api.razorpay.com/v1/orders', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Basic ' + Buffer.from(`${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`).toString('base64'),
+      },
+      body: JSON.stringify({ amount, currency: 'INR', notes: { email, months: m } }),
+    });
+    const order = await response.json();
+    if (!order.id) return res.status(500).json({ error: 'Order creation failed', details: order });
+    console.log(`💳 Order created: ${order.id} for ${email} — ₹${amount/100}`);
+    res.json({ success: true, orderId: order.id, amount, currency: 'INR', keyId: process.env.RAZORPAY_KEY_ID });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── Razorpay — Verify Payment ────────────────────────────
+app.post('/payment/verify', async (req, res) => {
+  const { email, orderId, paymentId, signature, months } = req.body;
+  const crypto = require('crypto');
+  const expected = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+    .update(`${orderId}|${paymentId}`).digest('hex');
+  if (expected !== signature) return res.status(400).json({ error: 'Invalid signature' });
+  // Activate paid plan
+  const m = parseInt(months) || 1;
+  const expiresAt = new Date();
+  expiresAt.setMonth(expiresAt.getMonth() + m);
+  const e = email.toLowerCase();
+  planStore[e] = { plan: 'paid', expiresAt: expiresAt.toISOString(), paymentId, orderId, activatedAt: new Date().toISOString() };
+  savePlanStore();
+  console.log(`✅ PAID: ${e} — Pro until ${expiresAt.toDateString()}`);
+  res.json({ success: true, plan: 'paid', expiresAt: expiresAt.toISOString() });
+});
+
+// ─── ADMIN ROUTES ──────────────────────────────────────────
+function isAdmin(req) { return req.query.key === process.env.DASHBOARD_KEY || req.headers['x-admin-key'] === process.env.DASHBOARD_KEY; }
+
+// Grant intern/team access
+app.post('/admin/grant', (req, res) => {
+  if (!isAdmin(req)) return res.status(401).json({ error: 'Unauthorized' });
+  const { email, plan, months } = req.body;
+  if (!email) return res.status(400).json({ error: 'Missing email' });
+  const p = plan || 'intern';
+  let expiresAt = null;
+  if (months) { const d = new Date(); d.setMonth(d.getMonth() + months); expiresAt = d.toISOString(); }
+  const e = email.toLowerCase().trim();
+  planStore[e] = { plan: p, expiresAt, addedBy: 'admin', addedAt: new Date().toISOString() };
+  savePlanStore();
+  console.log(`✅ ADMIN GRANT: ${e} → ${p}`);
+  res.json({ success: true, email: e, plan: p, expiresAt });
+});
+
+// Revoke access
+app.post('/admin/revoke', (req, res) => {
+  if (!isAdmin(req)) return res.status(401).json({ error: 'Unauthorized' });
+  const e = (req.body.email || '').toLowerCase().trim();
+  if (!e) return res.status(400).json({ error: 'Missing email' });
+  planStore[e] = { plan: 'free', revokedAt: new Date().toISOString() };
+  savePlanStore();
+  res.json({ success: true, email: e, plan: 'free' });
+});
+
+// List all users
+app.get('/admin/users', (req, res) => {
+  if (!isAdmin(req)) return res.status(401).json({ error: 'Unauthorized' });
+  const users = Object.keys({ ...userStore, ...planStore }).map(email => ({
+    email,
+    plan:      getUserPlan(email),
+    planName:  PLANS[getUserPlan(email)]?.name || 'Free',
+    used:      getDailyUsage(email),
+    limit:     PLANS[getUserPlan(email)]?.dailyLimit || 25,
+    remaining: getRemainingEmails(email),
+    expiresAt: planStore[email]?.expiresAt || null,
+    hasToken:  !!userStore[email]?.refreshToken,
+  }));
+  res.json({ users, total: users.length });
+});
+
+// ─── ADMIN DASHBOARD (Web UI) ─────────────────────────────
+app.get('/admin', async (req, res) => {
+  if (!isAdmin(req)) return res.status(401).send(`
+    <html><body style="font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;background:#f8f9fa">
+    <div style="text-align:center"><h2>🔐 Admin Access</h2>
+    <form onsubmit="location.href='/admin?key='+document.getElementById('k').value;return false">
+    <input id="k" type="password" placeholder="Admin Key" style="padding:10px;border:1px solid #ddd;border-radius:8px;margin:10px">
+    <button style="padding:10px 20px;background:#1a73e8;color:white;border:none;border-radius:8px;cursor:pointer">Login</button>
+    </form></div></body></html>
+  `);
+
+  const adminKey = req.query.key;
+  const allEmails = [...new Set([...Object.keys(userStore), ...Object.keys(planStore)])];
+  const users = allEmails.map(email => ({
+    email, plan: getUserPlan(email),
+    planName: PLANS[getUserPlan(email)]?.name || 'Free',
+    used: getDailyUsage(email), limit: PLANS[getUserPlan(email)]?.dailyLimit || 25,
+    expiresAt: planStore[email]?.expiresAt, hasToken: !!userStore[email]?.refreshToken,
+  }));
+
+  const totalPaid = users.filter(u => u.plan === 'paid').length;
+  const totalIntern = users.filter(u => u.plan === 'intern').length;
+  const totalFree = users.filter(u => u.plan === 'free').length;
+  const revenue = totalPaid * PLANS.paid.price;
+
+  try {
+    const sheets = await getSheets();
+    const r = await sheets.spreadsheets.values.get({spreadsheetId:process.env.TRACKING_SHEET_ID,range:'Tracking!A:F'});
+    const rows = (r.data.values||[]).slice(1).reverse();
+    const opens   = rows.filter(r=>r[1]==='EMAIL_OPENED').length;
+    const clicks  = rows.filter(r=>r[1]==='EMAIL_CLICKED').length;
+    const bounces = rows.filter(r=>r[1]==='EMAIL_BOUNCED').length;
+    const unsubs  = rows.filter(r=>r[1]==='UNSUBSCRIBED').length;
+
+    res.send(`<!DOCTYPE html>
+<html><head><title>EduJunior Admin</title><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f0f2f5;min-height:100vh}
+.header{background:linear-gradient(135deg,#1a73e8,#0d47a1);color:white;padding:20px 30px;display:flex;align-items:center;gap:12px}
+.header h1{font-size:20px;font-weight:600}
+.container{padding:24px;max-width:1200px;margin:0 auto}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;margin-bottom:24px}
+.card{background:white;border-radius:14px;padding:20px;box-shadow:0 2px 8px rgba(0,0,0,.06);text-align:center}
+.card .num{font-size:36px;font-weight:700;line-height:1.1}
+.card .lbl{font-size:12px;color:#5f6368;margin-top:6px}
+.green .num{color:#2e7d32} .blue .num{color:#1a73e8} .orange .num{color:#e65100} .red .num{color:#d93025} .purple .num{color:#6a1b9a}
+.section{background:white;border-radius:14px;padding:20px;box-shadow:0 2px 8px rgba(0,0,0,.06);margin-bottom:20px}
+.section h2{font-size:15px;font-weight:600;color:#202124;margin-bottom:16px;padding-bottom:10px;border-bottom:1px solid #f1f3f4}
+.grant-form{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
+.grant-form input,.grant-form select{padding:9px 13px;border:1px solid #ddd;border-radius:8px;font-size:13px;flex:1;min-width:180px}
+.btn{padding:9px 18px;border:none;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600}
+.btn-blue{background:#1a73e8;color:white} .btn-red{background:#d93025;color:white} .btn-green{background:#2e7d32;color:white}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{background:#f8f9fa;color:#5f6368;padding:10px 14px;text-align:left;font-weight:600;border-bottom:2px solid #e8eaed}
+td{padding:9px 14px;border-bottom:1px solid #f1f3f4;vertical-align:middle}
+tr:hover td{background:#f8f9fa}
+.badge{display:inline-block;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600}
+.badge-paid{background:#e8f5e9;color:#2e7d32}
+.badge-intern{background:#e3f2fd;color:#1565c0}
+.badge-free{background:#f5f5f5;color:#757575}
+.bar-bg{background:#e8eaed;border-radius:4px;height:6px;width:80px;display:inline-block;vertical-align:middle}
+.bar-fill{background:#1a73e8;border-radius:4px;height:6px}
+.msg{padding:10px 16px;border-radius:8px;margin-top:10px;font-size:13px;display:none}
+.msg.ok{background:#e8f5e9;color:#2e7d32} .msg.err{background:#fce8e6;color:#d93025}
+</style></head>
+<body>
+<div class="header">
+  <div>📊</div>
+  <div>
+    <h1>EduJunior Mail Merge — Admin Dashboard</h1>
+    <div style="font-size:12px;opacity:.8">${new Date().toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})}</div>
+  </div>
+</div>
+<div class="container">
+
+  <!-- Stats -->
+  <div class="grid">
+    <div class="card green"><div class="num">${totalPaid}</div><div class="lbl">💳 Paid Users</div></div>
+    <div class="card blue"><div class="num">${totalIntern}</div><div class="lbl">🎓 Interns (Free Pro)</div></div>
+    <div class="card purple"><div class="num">${totalFree}</div><div class="lbl">🆓 Free Users</div></div>
+    <div class="card green"><div class="num">₹${revenue}</div><div class="lbl">💰 Monthly Revenue</div></div>
+    <div class="card blue"><div class="num">${opens}</div><div class="lbl">📬 Opens</div></div>
+    <div class="card green"><div class="num">${clicks}</div><div class="lbl">🖱️ Clicks</div></div>
+    <div class="card red"><div class="num">${bounces}</div><div class="lbl">🔴 Bounces</div></div>
+    <div class="card orange"><div class="num">${unsubs}</div><div class="lbl">🚫 Unsubs</div></div>
+  </div>
+
+  <!-- Grant Access -->
+  <div class="section">
+    <h2>🎓 Grant / Revoke Access</h2>
+    <div class="grant-form">
+      <input type="email" id="grantEmail" placeholder="intern@email.com">
+      <select id="grantPlan">
+        <option value="intern">Intern (Free Pro)</option>
+        <option value="paid">Paid Pro</option>
+        <option value="free">Free (Revoke)</option>
+      </select>
+      <select id="grantMonths">
+        <option value="">Permanent</option>
+        <option value="1">1 Month</option>
+        <option value="3">3 Months</option>
+        <option value="6">6 Months</option>
+        <option value="12">1 Year</option>
+      </select>
+      <button class="btn btn-blue" onclick="grantAccess()">✅ Grant Access</button>
+      <button class="btn btn-red" onclick="revokeAccess()">❌ Revoke</button>
+    </div>
+    <div id="grantMsg" class="msg"></div>
+  </div>
+
+  <!-- Users Table -->
+  <div class="section">
+    <h2>👥 All Users (${users.length})</h2>
+    <table>
+      <tr><th>Email</th><th>Plan</th><th>Today's Usage</th><th>Token</th><th>Expires</th><th>Action</th></tr>
+      ${users.map(u => `
+      <tr>
+        <td>${u.email}</td>
+        <td><span class="badge badge-${u.plan}">${u.planName}</span></td>
+        <td>
+          <span style="font-size:12px;color:#5f6368">${u.used}/${u.limit}</span>
+          <div class="bar-bg"><div class="bar-fill" style="width:${Math.min(100,u.used/u.limit*100)}%"></div></div>
+        </td>
+        <td>${u.hasToken ? '✅' : '⚠️'}</td>
+        <td style="font-size:11px;color:#5f6368">${u.expiresAt ? new Date(u.expiresAt).toLocaleDateString('en-IN') : '—'}</td>
+        <td><button class="btn btn-red" style="padding:4px 10px;font-size:11px" onclick="quickRevoke('${u.email}')">Revoke</button></td>
+      </tr>`).join('')}
+    </table>
+  </div>
+
+  <!-- Recent Events -->
+  <div class="section">
+    <h2>📋 Recent Events</h2>
+    <table>
+      <tr><th>Time</th><th>Event</th><th>Email</th></tr>
+      ${rows.slice(0,50).map(r=>`<tr>
+        <td style="font-size:11px;color:#5f6368">${r[0]||''}</td>
+        <td><span class="badge" style="${{EMAIL_OPENED:'background:#e8f5e9;color:#2e7d32',EMAIL_CLICKED:'background:#1b5e20;color:white',UNSUBSCRIBED:'background:#fce8e6;color:#d93025',EMAIL_BOUNCED:'background:#fff3e0;color:#e65100',EMAIL_SENT:'background:#f1f3f4;color:#5f6368'}[r[1]]||'background:#f1f3f4;color:#333'}">${r[1]||''}</span></td>
+        <td>${r[2]||''}</td>
+      </tr>`).join('')}
+    </table>
+  </div>
+</div>
+
+<script>
+const KEY = '${adminKey}';
+async function grantAccess() {
+  const email  = document.getElementById('grantEmail').value.trim();
+  const plan   = document.getElementById('grantPlan').value;
+  const months = document.getElementById('grantMonths').value;
+  if (!email) return showMsg('Enter email!', false);
+  const r = await fetch('/admin/grant?key='+KEY, {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ email, plan, months: months ? parseInt(months) : null })
+  });
+  const d = await r.json();
+  if (d.success) { showMsg('✅ ' + email + ' → ' + plan + ' access granted!', true); setTimeout(()=>location.reload(),1500); }
+  else showMsg('❌ ' + d.error, false);
+}
+async function revokeAccess() {
+  const email = document.getElementById('grantEmail').value.trim();
+  if (!email) return showMsg('Enter email!', false);
+  const r = await fetch('/admin/revoke?key='+KEY, {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ email })
+  });
+  const d = await r.json();
+  if (d.success) { showMsg('✅ ' + email + ' revoked!', true); setTimeout(()=>location.reload(),1500); }
+  else showMsg('❌ ' + d.error, false);
+}
+async function quickRevoke(email) {
+  if (!confirm('Revoke ' + email + '?')) return;
+  await fetch('/admin/revoke?key='+KEY, {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ email })
+  });
+  location.reload();
+}
+function showMsg(text, ok) {
+  const el = document.getElementById('grantMsg');
+  el.textContent = text; el.className = 'msg ' + (ok ? 'ok' : 'err');
+  el.style.display = 'block'; setTimeout(()=>el.style.display='none', 3000);
+}
+</script>
+</body></html>`);
+  } catch(e) { res.status(500).send('Error: ' + e.message); }
+});
+
+app.get('/',(req,res)=>res.json({status:'✅ EduJunior v5',users:Object.keys(userStore).length,jobs:Object.keys(scheduleStore).length,time:new Date()}));
+
+// ═══════════════════════════════════════════════════════════
+//  executeScheduledJob — The actual email sender
+// ═══════════════════════════════════════════════════════════
+async function executeScheduledJob(job) {
+  const { recipients, draftSubject, draftHtml, sender,
+          sheetId, sheetTab, userEmail } = job;
+  let sent = 0;
+
+  // Get fresh token
+  let activeToken = await getAccessToken(userEmail);
+  if (!activeToken) {
+    console.log(`❌ No token for ${userEmail} — job failed`);
+    throw new Error('No access token available');
+  }
+  console.log(`✅ Token ready for ${userEmail}`);
+
+  const serverUrl = 'https://mail-merge-tracker.onrender.com';
+  const camp      = encodeURIComponent((draftSubject||'sched') + '_' + Date.now());
+  const sid       = encodeURIComponent(sheetId || '');
+  const stab      = encodeURIComponent(sheetTab || 'Sheet1');
+
+  function wrapHtml(raw) {
+    if (!raw.toLowerCase().includes('<html'))
+      return `<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body>${raw}</body></html>`;
+    if (!raw.toLowerCase().includes('</body>')) return raw + '</body></html>';
+    return raw;
+  }
+
+  for (const r of recipients) {
+    try {
+      let html    = (draftHtml||'').replace(/\{\{(\w[\w\s]*)\}\}/g,(m,k)=>r[k.trim().toLowerCase()]||r[k.trim()]||m);
+      let subject = (draftSubject||'').replace(/\{\{(\w[\w\s]*)\}\}/g,(m,k)=>r[k.trim().toLowerCase()]||r[k.trim()]||m);
+      html = wrapHtml(html);
+
+      const enc      = encodeURIComponent(r.email);
+      const unsubUrl = `${serverUrl}/unsubscribe?email=${enc}&campaign=${camp}&sheetId=${sid}&tab=${stab}`;
+      html = html.replace('</body>',
+        `<img src="${serverUrl}/track/open?email=${enc}&campaign=${camp}&sheetId=${sid}&tab=${stab}" width="1" height="1" style="display:none" alt=""/></body>`);
+      html = html.replace(/href="(https?:\/\/[^"]+)"/gi,(m,orig) =>
+        orig.includes(serverUrl) ? m :
+        `href="${serverUrl}/track/click?email=${enc}&campaign=${camp}&sheetId=${sid}&tab=${stab}&url=${encodeURIComponent(orig)}"`);
+      html = html.replace('</body>',
+        `<div style="margin-top:28px;padding-top:14px;border-top:1px solid #e8eaed;text-align:center;font-family:Arial,sans-serif;font-size:11px;color:#9aa0a6;">
+        <a href="${unsubUrl}" style="color:#9aa0a6;">Unsubscribe</a></div></body>`);
+
+      const boundary = 'mm_' + Math.random().toString(36).slice(2);
+      const rawEmail = [
+        `From: ${sender}`, `To: ${r.email}`, `Subject: ${subject}`,
+        `MIME-Version: 1.0`, `Content-Type: multipart/alternative; boundary="${boundary}"`,
+        ``, `--${boundary}`, `Content-Type: text/html; charset=UTF-8`, ``, html, ``, `--${boundary}--`
+      ].join('\r\n');
+      const encoded = Buffer.from(rawEmail).toString('base64')
+        .replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+
+      const sr = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+        method:'POST',
+        headers: { Authorization:`Bearer ${activeToken}`, 'Content-Type':'application/json' },
+        body: JSON.stringify({ raw: encoded })
+      });
+      console.log(`📤 ${r.email}: ${sr.status}`);
+
+      if (sr.ok) {
+        sent++;
+        if (sheetId) await updateStatusUserToken(activeToken, sheetId, sheetTab||'Sheet1', r.email, 'EMAIL_SENT');
+      } else {
+        const err = await sr.text();
+        console.log(`❌ ${r.email}: ${err.slice(0,100)}`);
+        // If 401, refresh token and retry once
+        if (err.includes('401') || err.includes('Invalid Credentials')) {
+          activeToken = await getAccessToken(userEmail);
+        }
+      }
+    } catch(e) { console.error(`Error ${r.email}:`, e.message); }
+    await sleep(400);
+  }
+  return sent;
+}
+
+// ═══════════════════════════════════════════════════════════
+//  STARTUP — Load schedule store + restore pending jobs
+// ═══════════════════════════════════════════════════════════
+scheduleStore = loadScheduleStore();
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`✅ EduJunior Tracker v5 on port ${PORT}`);
+  // Restore any pending scheduled jobs after restart!
+  setTimeout(() => restorePendingJobs(), 3000);
+});
