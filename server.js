@@ -237,29 +237,47 @@ async function getSheets() {
 // ✅ REFRESH TOKEN — get new access token anytime
 async function getAccessToken(userEmail) {
   const user = userStore[userEmail];
-  if (!user) return null;
-  if (!user.refreshToken) return user.accessToken || null;
-  try {
-    const res = await fetch('https://oauth2.googleapis.com/token', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        client_id:     process.env.OAUTH_CLIENT_ID,
-        client_secret: process.env.OAUTH_CLIENT_SECRET,
-        refresh_token: user.refreshToken,
-        grant_type:    'refresh_token',
-      }),
-    });
-    const data = await res.json();
-    if (data.access_token) {
-      user.accessToken = data.access_token;
-      saveUserStore(); // ✅ Save latest access token
-      console.log(`🔑 Token refreshed for ${userEmail}`);
-      return data.access_token;
+  if (!user) { console.log(`❌ No user record for ${userEmail}`); return null; }
+
+  // Has refresh token — always get fresh access token
+  if (user.refreshToken) {
+    try {
+      const res = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          client_id:     process.env.OAUTH_CLIENT_ID,
+          client_secret: process.env.OAUTH_CLIENT_SECRET,
+          refresh_token: user.refreshToken,
+          grant_type:    'refresh_token',
+        }),
+      });
+      const data = await res.json();
+      if (data.access_token) {
+        user.accessToken = data.access_token;
+        user.tokenSavedAt = Date.now();
+        saveUserStore();
+        console.log(`🔑 Fresh token for ${userEmail}`);
+        return data.access_token;
+      }
+      console.error(`❌ Refresh failed for ${userEmail}: ${data.error}`);
+    } catch(e) { console.error(`❌ Refresh error for ${userEmail}:`, e.message); }
+  }
+
+  // No refresh token — check if access token is still fresh (< 50 min old)
+  if (user.accessToken) {
+    const age = Date.now() - (user.tokenSavedAt || 0);
+    const ageMin = Math.round(age / 60000);
+    if (age < 50 * 60 * 1000) {
+      console.log(`⚡ Using access token for ${userEmail} (${ageMin} min old)`);
+      return user.accessToken;
     }
-    console.error(`Token refresh failed: ${data.error}`);
-    return user.accessToken || null;
-  } catch(e) { return user.accessToken || null; }
+    console.log(`⚠️ Token expired for ${userEmail} (${ageMin} min old) — need sign in`);
+    return null; // Token too old — don't use it
+  }
+
+  console.log(`❌ No token for ${userEmail}`);
+  return null;
 }
 
 const STATUS_COLORS = {
@@ -797,7 +815,8 @@ app.post('/auth/restore-session', async (req, res) => {
 
   if (userStore[userEmail]) {
     // User exists — just update access token + sheet info
-    userStore[userEmail].accessToken = accessToken;
+    userStore[userEmail].accessToken  = accessToken;
+    userStore[userEmail].tokenSavedAt = Date.now(); // Track when token was saved
     if (sheetId)  userStore[userEmail].sheetId  = sheetId;
     if (sheetTab) userStore[userEmail].sheetTab = sheetTab;
     saveUserStore();
@@ -810,6 +829,7 @@ app.post('/auth/restore-session', async (req, res) => {
     userStore[userEmail] = {
       refreshToken: null,
       accessToken,
+      tokenSavedAt: Date.now(), // Track when token was saved
       sheetId:  sheetId  || '',
       sheetTab: sheetTab || 'Sheet1',
       savedAt:  new Date().toISOString(),
@@ -920,11 +940,12 @@ app.get('/dashboard', async (req,res) => {
 app.get('/user/status', (req, res) => {
   const email = (req.query.email || '').toLowerCase();
   if (!email) return res.status(400).json({ error: 'Missing email' });
-  const plan      = getUserPlan(email);
-  const limit     = PLANS[plan]?.dailyLimit || 25;
-  const used      = getDailyUsage(email);
-  const remaining = Math.max(0, limit - used);
-  res.json({ plan, planName: PLANS[plan]?.name || 'Free', limit, used, remaining, email });
+  const plan           = getUserPlan(email);
+  const limit          = PLANS[plan]?.dailyLimit || 25;
+  const used           = getDailyUsage(email);
+  const remaining      = Math.max(0, limit - used);
+  const hasRefreshToken = !!(userStore[email]?.refreshToken);
+  res.json({ plan, planName: PLANS[plan]?.name || 'Free', limit, used, remaining, email, hasRefreshToken });
 });
 
 // ─── Check limit before normal (non-scheduled) send ──────
@@ -1294,9 +1315,29 @@ async function executeScheduledJob(job) {
       } else {
         const err = await sr.text();
         console.log(`❌ ${r.email}: ${err.slice(0,100)}`);
-        // If 401, refresh token and retry once
-        if (err.includes('401') || err.includes('Invalid Credentials')) {
+        // If 401, force refresh and retry this recipient
+        if (err.includes('401') || err.includes('Invalid Credentials') || err.includes('invalid_token')) {
+          console.log(`🔄 401 detected — refreshing token for ${userEmail}`);
+          // Temporarily clear access token to force refresh
+          if (userStore[userEmail]) {
+            userStore[userEmail].tokenSavedAt = 0; // Force expiry
+          }
           activeToken = await getAccessToken(userEmail);
+          if (activeToken) {
+            // Retry this email
+            try {
+              const retry = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+                method:'POST',
+                headers: { Authorization:`Bearer ${activeToken}`, 'Content-Type':'application/json' },
+                body: JSON.stringify({ raw: encoded })
+              });
+              if (retry.ok) {
+                sent++;
+                if (sheetId) await updateStatusUserToken(activeToken, sheetId, sheetTab||'Sheet1', r.email, 'EMAIL_SENT');
+                console.log(`✅ Retry success: ${r.email}`);
+              }
+            } catch(retryErr) { console.error(`Retry failed: ${retryErr.message}`); }
+          }
         }
       }
     } catch(e) { console.error(`Error ${r.email}:`, e.message); }
