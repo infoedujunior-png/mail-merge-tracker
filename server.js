@@ -466,6 +466,12 @@ async function checkBouncesForUser(userEmail) {
   if (!token) { console.log(`⏭️ Skip ${userEmail} — no token (open extension to refresh)`); return; }
 
   if (!user.processedBounces) user.processedBounces = new Set();
+  // Reset every 2 hrs — ensures failed sheet updates get retried
+  if (!user.bouncesResetAt || Date.now() - user.bouncesResetAt > 2*60*60*1000) {
+    user.processedBounces = new Set();
+    user.bouncesResetAt   = Date.now();
+    console.log(`🔄 Reset bounce cache for ${userEmail}`);
+  }
 
   try {
     // Try multiple queries — different mail servers use different senders
@@ -520,9 +526,11 @@ async function checkBouncesForUser(userEmail) {
 
       // Must look like a bounce
       const looksLikeBounce =
-        /mailer.daemon|postmaster|mail.*delivery|delivery.*fail|undeliver|bounce|failure notice|returned mail/i.test(subject + fromHdr);
+        /mailer.daemon|postmaster|mail.*delivery|delivery.*fail|undeliver|bounce|failure notice|returned mail|address not found|user unknown|rejected|could not deliver/i.test(subject + fromHdr);
+
+      console.log(`  → Subject: "${subject.slice(0,70)}" | Bounce: ${looksLikeBounce}`);
+
       if (!looksLikeBounce) {
-        console.log(`  → Skipped (not a bounce)`);
         user.processedBounces.add(msg.id);
         continue;
       }
@@ -532,8 +540,8 @@ async function checkBouncesForUser(userEmail) {
 
       if (info.email) {
         console.log(`🔴 BOUNCE: ${info.email} — ${info.reason}`);
-        await updateStatus(user.sheetId, user.sheetTab || 'Sheet1', info.email, 'EMAIL_BOUNCED');
-        await writeBounceReason(user.sheetId, user.sheetTab || 'Sheet1', info.email, info.reason);
+        // ✅ Use USER token (not service account) — works on all intern sheets!
+        await updateBounceWithUserToken(token, user.sheetId, user.sheetTab || 'Sheet1', info.email, info.reason);
         await logEvent({ type:'EMAIL_BOUNCED', email:info.email, campaign:'bounce', url:info.reason });
       } else {
         console.log(`  → No email extracted — skipping`);
@@ -575,6 +583,114 @@ async function writeBounceReason(sheetId, tab, email, reason) {
       }
     }
   } catch(e) { console.error('writeBounceReason error:', e.message); }
+}
+
+// ✅ Update bounce using USER's own token — works on ALL sheets!
+async function updateBounceWithUserToken(token, sheetId, tab, email, reason) {
+  try {
+    const sheetTab = tab || 'Sheet1';
+    // Get sheet data
+    const res = await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(sheetTab + '!A1:Z500')}`,
+      { headers: { Authorization: `Bearer ${token}` } }
+    );
+    if (!res.ok) { console.error(`❌ Bounce sheet read failed: ${res.status}`); return; }
+
+    const data    = await res.json();
+    const rows    = data.values || [];
+    if (rows.length < 2) return;
+
+    const headers  = rows[0].map(h => (h||'').toLowerCase().trim());
+    const emailCol = headers.findIndex(h => h.includes('email'));
+    if (emailCol < 0) { console.error('❌ No email column'); return; }
+
+    let statCol = headers.findIndex(h => h.includes('merge status') || h === 'status');
+    if (statCol < 0) {
+      // Create Merge Status column
+      statCol = headers.length;
+      await fetch(
+        `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(sheetTab + '!' + toCol(statCol+1) + '1')}?valueInputOption=USER_ENTERED`,
+        { method:'PUT', headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' },
+          body: JSON.stringify({ values:[['Merge Status']] }) }
+      );
+    }
+
+    let bounceCol = headers.findIndex(h => h.includes('bounce reason'));
+    if (bounceCol < 0) {
+      bounceCol = Math.max(statCol, headers.length);
+      await fetch(
+        `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(sheetTab + '!' + toCol(bounceCol+1) + '1')}?valueInputOption=USER_ENTERED`,
+        { method:'PUT', headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' },
+          body: JSON.stringify({ values:[['Bounce Reason']] }) }
+      );
+    }
+
+    // Find row
+    let rowNum = -1;
+    for (let i = 1; i < rows.length; i++) {
+      if ((rows[i][emailCol]||'').toLowerCase().trim() === email.toLowerCase().trim()) {
+        rowNum = i + 1; break;
+      }
+    }
+    if (rowNum < 0) { console.log(`❌ Bounce: ${email} not found in sheet`); return; }
+
+    // Priority check — don't overwrite higher status
+    const P   = { SCHEDULED:0, EMAIL_SENT:1, EMAIL_OPENED:2, EMAIL_CLICKED:3, EMAIL_BOUNCED:4, UNSUBSCRIBED:5 };
+    const cur = ((rows[rowNum-1]||[])[statCol]||'').toUpperCase().trim();
+    if ((P[cur]||0) >= (P['EMAIL_BOUNCED']||0)) {
+      console.log(`⏭️ Skip bounce — current status: ${cur}`);
+      return;
+    }
+
+    const nowStr = new Date().toLocaleString('en-IN', {
+      timeZone:'Asia/Kolkata', day:'2-digit', month:'short',
+      year:'numeric', hour:'2-digit', minute:'2-digit', hour12:true
+    });
+
+    // Write EMAIL_BOUNCED status
+    await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(sheetTab + '!' + toCol(statCol+1) + rowNum)}?valueInputOption=USER_ENTERED`,
+      { method:'PUT', headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' },
+        body: JSON.stringify({ values:[['EMAIL_BOUNCED']] }) }
+    );
+
+    // Write Bounce Reason
+    await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(sheetTab + '!' + toCol(bounceCol+1) + rowNum)}?valueInputOption=USER_ENTERED`,
+      { method:'PUT', headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' },
+        body: JSON.stringify({ values:[[reason]] }) }
+    );
+
+    // Apply color + note via batchUpdate
+    try {
+      const metaRes = await fetch(
+        `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}?fields=sheets.properties`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      const metaData = await metaRes.json();
+      const sheetObj = (metaData.sheets||[]).find(s => s.properties.title === sheetTab);
+      const gid      = sheetObj?.properties?.sheetId ?? 0;
+
+      const color   = STATUS_COLORS['EMAIL_BOUNCED'];
+      const noteText = `Bounced on: ${nowStr}`;
+
+      await fetch(
+        `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}:batchUpdate`,
+        { method:'POST', headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' },
+          body: JSON.stringify({ requests:[{ updateCells:{
+            range:{ sheetId:gid, startRowIndex:rowNum-1, endRowIndex:rowNum, startColumnIndex:statCol, endColumnIndex:statCol+1 },
+            rows:[{ values:[{
+              note: noteText,
+              userEnteredFormat:{ backgroundColor:color, textFormat:{ bold:true, foregroundColor:{red:1,green:1,blue:1} } }
+            }]}],
+            fields:'note,userEnteredFormat(backgroundColor,textFormat)'
+          }}]})
+        }
+      );
+      console.log(`✅ Bounce updated: ${email} → EMAIL_BOUNCED | ${reason}`);
+    } catch(e) { console.error('Bounce color error:', e.message); }
+
+  } catch(e) { console.error('updateBounceWithUserToken error:', e.message); }
 }
 
 function getEmailBody(payload) {
@@ -751,7 +867,7 @@ app.get('/ping', async (req,res) => {
   checkAllBounces().catch(()=>{});
 });
 
-// 🔍 Manual bounce check endpoint — for testing
+// 🔍 Manual bounce check endpoint
 app.get('/bounce-check', async (req,res) => {
   if (req.query.key !== process.env.DASHBOARD_KEY) return res.status(401).json({error:'Unauthorized'});
   const users = Object.keys(userStore);
@@ -760,6 +876,21 @@ app.get('/bounce-check', async (req,res) => {
     await checkBouncesForUser(u);
     await sleep(500);
   }
+});
+
+// 🔄 Reset bounce cache — force re-check all bounce emails
+app.get('/bounce-reset', (req,res) => {
+  if (req.query.key !== process.env.DASHBOARD_KEY) return res.status(401).json({error:'Unauthorized'});
+  const email = req.query.email; // optional — reset specific user
+  let count = 0;
+  for (const [u, user] of Object.entries(userStore)) {
+    if (email && u !== email.toLowerCase()) continue;
+    user.processedBounces = new Set();
+    user.bouncesResetAt   = 0;
+    count++;
+  }
+  console.log(`🔄 Bounce cache reset for ${count} users`);
+  res.json({ success:true, reset: count, message: `Cache cleared! Next bounce check will re-process all emails.` });
 });
 
 app.get('/track/open', async (req,res) => {
