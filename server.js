@@ -993,21 +993,8 @@ app.post('/schedule', async (req,res) => {
     if (!scheduledAt||!recipients||!draftHtml)
       return res.status(400).json({error:'Missing fields'});
 
-    // Check limit
-    if (userEmail) {
-      const remaining = getRemainingEmails(userEmail);
-      if (recipients.length > remaining) {
-        const plan  = getUserPlan(userEmail);
-        const limit = PLANS[plan]?.dailyLimit || 25;
-        return res.status(403).json({
-          error:'limit_exceeded', plan, limit,
-          used: getDailyUsage(userEmail), remaining,
-          message: remaining === 0
-            ? 'Daily limit reached! Upgrade to Pro for 400 emails/day.'
-            : `Only ${remaining} emails left today.`
-        });
-      }
-    }
+    // Limits disabled — not on Web Store yet
+    // if (userEmail) { const remaining = getRemainingEmails(userEmail); ... }
 
     const delay = new Date(scheduledAt).getTime() - Date.now();
     if (delay < -60000) return res.status(400).json({error:'Past time'});
@@ -1148,6 +1135,26 @@ app.post('/payment/verify', async (req, res) => {
 function isAdmin(req) { return req.query.key === process.env.DASHBOARD_KEY || req.headers['x-admin-key'] === process.env.DASHBOARD_KEY; }
 
 // Grant intern/team access
+// ✅ Bulk grant — multiple emails at once
+app.post('/admin/bulk-grant', (req, res) => {
+  const { key, emails, plan, months } = req.body;
+  if (key !== process.env.DASHBOARD_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  if (!emails || !Array.isArray(emails)) return res.status(400).json({ error: 'emails array required' });
+  const p = plan || 'intern';
+  let expiresAt = null;
+  if (months) { const d = new Date(); d.setMonth(d.getMonth() + parseInt(months)); expiresAt = d.toISOString(); }
+  const results = [];
+  for (const email of emails) {
+    const e = email.toLowerCase().trim();
+    if (!e) continue;
+    planStore[e] = { plan: p, expiresAt, addedBy: 'admin-bulk', addedAt: new Date().toISOString() };
+    results.push(e);
+  }
+  savePlanStore();
+  console.log(`✅ Bulk grant: ${results.length} users → ${p}`);
+  res.json({ success: true, granted: results.length, plan: p, emails: results });
+});
+
 app.post('/admin/grant', (req, res) => {
   if (!isAdmin(req)) return res.status(401).json({ error: 'Unauthorized' });
   const { email, plan, months } = req.body;
