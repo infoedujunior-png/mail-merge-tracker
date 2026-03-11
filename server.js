@@ -17,7 +17,7 @@ app.use(express.json({ limit: '10mb' }));
 const PIXEL = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7','base64');
 
 const trackingStore = {};
-let scheduleStore   = {}; // Will be loaded from file after helper functions defined
+let scheduleStore   = {};
 let lastBounceCheck = 0;
 
 // ══════════════════════════════════════════════════════════
@@ -32,7 +32,6 @@ function restorePendingJobs() {
     const delay = new Date(job.scheduledAt).getTime() - Date.now();
 
     if (delay < -5 * 60 * 1000) {
-      // Job is more than 5 min overdue — run immediately
       console.log(`⚡ Overdue job ${job.id} — running immediately`);
       scheduleStore[job.id].status = 'running';
       saveScheduleStore();
@@ -49,10 +48,8 @@ function restorePendingJobs() {
         console.log(`❌ Overdue job ${job.id} failed: ${e.message}`);
       });
     } else if (delay <= 0) {
-      // Just overdue — run now
       setImmediate(() => fireJob(job.id));
     } else {
-      // Future job — reschedule
       console.log(`⏰ Re-scheduling job ${job.id} in ${Math.round(delay/60000)} min`);
       setTimeout(() => fireJob(job.id), delay);
     }
@@ -85,12 +82,12 @@ async function fireJob(id) {
 // ══════════════════════════════════════════════════════════
 const PLANS = {
   free:   { dailyLimit: 25,  name: 'Free',       price: 0    },
-  paid:   { dailyLimit: 400, name: 'Pro',         price: 299  }, // ₹299/month
-  intern: { dailyLimit: 400, name: 'Team (Free)', price: 0    }, // Admin grants free
+  paid:   { dailyLimit: 400, name: 'Pro',         price: 299  },
+  intern: { dailyLimit: 400, name: 'Team (Free)', price: 0    },
 };
 
 const PLANS_FILE = path.join('/tmp', 'edujunior_plans.json');
-let planStore = {}; // { email: { plan, expiresAt, razorpaySubId, addedBy, addedAt } }
+let planStore = {};
 
 function loadPlanStore() {
   try {
@@ -111,9 +108,8 @@ function savePlanStore() {
 
 planStore = loadPlanStore();
 
-// Daily email count tracking (resets at midnight IST)
 const dailyCountFile = path.join('/tmp', 'edujunior_counts.json');
-let dailyCounts = {}; // { email: { count, date } }
+let dailyCounts = {};
 
 function loadDailyCounts() {
   try {
@@ -134,7 +130,6 @@ function getUserPlan(email) {
   const e = (email || '').toLowerCase();
   const p = planStore[e];
   if (!p) return 'free';
-  // Check if paid plan expired
   if (p.plan === 'paid' && p.expiresAt && new Date(p.expiresAt) < new Date()) return 'free';
   return p.plan || 'free';
 }
@@ -166,7 +161,8 @@ function addEmailCount(email, count = 1) {
 }
 
 // ══════════════════════════════════════════════════════════
-//  PERSISTENT TOKEN STORAGE — survives Render restarts! ✅
+//  PERSISTENT TOKEN STORAGE
+//  ✅ FIX 1: tokenSavedAt bhi save hoga — no re-signin!
 // ══════════════════════════════════════════════════════════
 const TOKENS_FILE = path.join('/tmp', 'edujunior_tokens.json');
 
@@ -183,12 +179,13 @@ function loadUserStore() {
 
 function saveUserStore() {
   try {
-    // Save only essential fields — not processedBounces Set (not serializable)
     const toSave = {};
     for (const [email, user] of Object.entries(userStore)) {
       toSave[email] = {
         refreshToken: user.refreshToken,
         accessToken:  user.accessToken,
+        // ✅ FIX 1: tokenSavedAt save karo — warna restart pe sab expire dikh ta tha
+        tokenSavedAt: user.tokenSavedAt || 0,
         sheetId:      user.sheetId,
         sheetTab:     user.sheetTab,
         savedAt:      user.savedAt,
@@ -199,11 +196,10 @@ function saveUserStore() {
   } catch(e) { console.error('Save tokens error:', e.message); }
 }
 
-// Load on startup
 const userStore = loadUserStore();
 
 // ══════════════════════════════════════════════════════════
-//  PERSISTENT SCHEDULE STORAGE — survives Render restarts!
+//  PERSISTENT SCHEDULE STORAGE
 // ══════════════════════════════════════════════════════════
 const SCHEDULE_FILE = path.join('/tmp', 'edujunior_schedule.json');
 
@@ -234,12 +230,13 @@ async function getSheets() {
   return google.sheets({ version: 'v4', auth });
 }
 
-// ✅ REFRESH TOKEN — get new access token anytime
+// ✅ FIX 1 (cont): getAccessToken — refresh token pe poora rely karo
+// Agar refresh token hai → hamesha fresh token lo (restart ke baad bhi)
+// Agar sirf access token hai → tokenSavedAt se age check karo (ab save hota hai disk pe)
 async function getAccessToken(userEmail) {
   const user = userStore[userEmail];
   if (!user) { console.log(`❌ No user record for ${userEmail}`); return null; }
 
-  // Has refresh token — always get fresh access token
   if (user.refreshToken) {
     try {
       const res = await fetch('https://oauth2.googleapis.com/token', {
@@ -254,9 +251,9 @@ async function getAccessToken(userEmail) {
       });
       const data = await res.json();
       if (data.access_token) {
-        user.accessToken = data.access_token;
+        user.accessToken  = data.access_token;
         user.tokenSavedAt = Date.now();
-        saveUserStore();
+        saveUserStore(); // ✅ Fresh token disk pe save hoga
         console.log(`🔑 Fresh token for ${userEmail}`);
         return data.access_token;
       }
@@ -273,7 +270,7 @@ async function getAccessToken(userEmail) {
       return user.accessToken;
     }
     console.log(`⚠️ Token expired for ${userEmail} (${ageMin} min old) — need sign in`);
-    return null; // Token too old — don't use it
+    return null;
   }
 
   console.log(`❌ No token for ${userEmail}`);
@@ -281,7 +278,7 @@ async function getAccessToken(userEmail) {
 }
 
 const STATUS_COLORS = {
-  SCHEDULED:     { red:0.68, green:0.85, blue:0.90 }, // light blue
+  SCHEDULED:     { red:0.68, green:0.85, blue:0.90 },
   EMAIL_SENT:    { red:0.85, green:0.85, blue:0.85 },
   EMAIL_OPENED:  { red:0.72, green:0.94, blue:0.74 },
   EMAIL_CLICKED: { red:0.20, green:0.66, blue:0.33 },
@@ -318,7 +315,6 @@ async function updateStatus(sheetId, tab, email, newStatus) {
     if ((P[cur]||0)>=(P[newStatus]||0)) { console.log(`⏭️ Skip ${cur}>=${newStatus}`); return; }
     await sheets.spreadsheets.values.update({ spreadsheetId:sheetId, range:`${sheetTab}!${toCol(statCol+1)}${row}`, valueInputOption:'USER_ENTERED', requestBody:{values:[[newStatus]]} });
 
-    // ✅ Get sheet GID
     let gid = 0;
     try {
       const meta = await sheets.spreadsheets.get({ spreadsheetId:sheetId, fields:'sheets.properties' });
@@ -326,9 +322,6 @@ async function updateStatus(sheetId, tab, email, newStatus) {
       gid = sheetObj?.properties?.sheetId ?? 0;
     } catch(e) { console.log('GID fetch error:', e.message); }
 
-    console.log('GID:', gid, '| row:', row, '| statCol:', statCol);
-
-    // ✅ Use ONE updateCells request — sets BOTH color AND note together
     const color  = STATUS_COLORS[newStatus];
     const isBold = ['EMAIL_CLICKED','EMAIL_BOUNCED'].includes(newStatus);
     const nowStr = new Date().toLocaleString('en-IN', {
@@ -338,9 +331,7 @@ async function updateStatus(sheetId, tab, email, newStatus) {
     const noteMap = { EMAIL_SENT:'Sent', EMAIL_OPENED:'Opened', EMAIL_CLICKED:'Clicked', EMAIL_BOUNCED:'Bounced', UNSUBSCRIBED:'Unsubscribed' };
     const noteText = (noteMap[newStatus]||newStatus) + ' on: ' + nowStr;
 
-    const cellValue = {
-      note: noteText,
-    };
+    const cellValue = { note: noteText };
     if (color) {
       cellValue.userEnteredFormat = {
         backgroundColor: color,
@@ -394,7 +385,7 @@ async function updateStatusUserToken(token, sheetId, tab, email, status) {
     const cur=((rows[row-1]||[])[statCol]||'').toUpperCase().trim();
     if ((P[cur]||0)>=(P[status]||0)) return;
     await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(sheetTab+'!'+toCol(statCol+1)+row)}?valueInputOption=USER_ENTERED`,{method:'PUT',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify({values:[[status]]})});
-    // ✅ Color + Note via USER TOKEN (same token used for sheet write)
+
     try {
       const nowStr  = new Date().toLocaleString('en-IN', { timeZone:'Asia/Kolkata', day:'2-digit', month:'short', year:'numeric', hour:'2-digit', minute:'2-digit', hour12:true });
       const noteMap = { EMAIL_SENT:'Sent', EMAIL_OPENED:'Opened', EMAIL_CLICKED:'Clicked', EMAIL_BOUNCED:'Bounced', UNSUBSCRIBED:'Unsubscribed' };
@@ -402,7 +393,6 @@ async function updateStatusUserToken(token, sheetId, tab, email, status) {
       const color    = STATUS_COLORS[status];
       const isBold   = ['EMAIL_CLICKED','EMAIL_BOUNCED'].includes(status);
 
-      // Get GID via user token
       let gid = 0;
       try {
         const metaRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}?fields=sheets.properties`, { headers:{Authorization:`Bearer ${token}`} });
@@ -420,7 +410,6 @@ async function updateStatusUserToken(token, sheetId, tab, email, status) {
       }
       const fieldMask = color ? 'note,userEnteredFormat(backgroundColor,textFormat)' : 'note';
 
-      // batchUpdate via USER TOKEN
       const batchRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}:batchUpdate`, {
         method: 'POST',
         headers: { Authorization:`Bearer ${token}`, 'Content-Type':'application/json' },
@@ -449,11 +438,9 @@ async function logEvent(e) {
 }
 
 // ═══════════════════════════════════════════════════════════
-// ═══════════════════════════════════════════════════════════
-//  SERVER-SIDE BOUNCE DETECTION — Instant + Scheduled
+//  SERVER-SIDE BOUNCE DETECTION
 // ═══════════════════════════════════════════════════════════
 
-// Run bounce check every 2 minutes automatically (no need for ping!)
 setInterval(() => {
   checkAllBounces().catch(e => console.error('Interval bounce error:', e.message));
 }, 2 * 60 * 1000);
@@ -463,10 +450,9 @@ async function checkBouncesForUser(userEmail) {
   if (!user?.sheetId) { console.log(`⏭️ Skip ${userEmail} — no sheetId`); return; }
 
   const token = await getAccessToken(userEmail);
-  if (!token) { console.log(`⏭️ Skip ${userEmail} — no token (open extension to refresh)`); return; }
+  if (!token) { console.log(`⏭️ Skip ${userEmail} — no token`); return; }
 
   if (!user.processedBounces) user.processedBounces = new Set();
-  // Reset every 2 hrs — ensures failed sheet updates get retried
   if (!user.bouncesResetAt || Date.now() - user.bouncesResetAt > 2*60*60*1000) {
     user.processedBounces = new Set();
     user.bouncesResetAt   = Date.now();
@@ -474,7 +460,6 @@ async function checkBouncesForUser(userEmail) {
   }
 
   try {
-    // Try multiple queries — different mail servers use different senders
     const queries = [
       'from:mailer-daemon newer_than:7d',
       'from:postmaster newer_than:7d',
@@ -522,9 +507,6 @@ async function checkBouncesForUser(userEmail) {
       const body    = getEmailBody(md.payload);
       const full    = subject + ' ' + fromHdr + ' ' + body;
 
-      console.log(`  → Subject: "${subject.slice(0,80)}" | From: "${fromHdr.slice(0,50)}"`);
-
-      // Must look like a bounce
       const looksLikeBounce =
         /mailer.daemon|postmaster|mail.*delivery|delivery.*fail|undeliver|bounce|failure notice|returned mail|address not found|user unknown|rejected|could not deliver/i.test(subject + fromHdr);
 
@@ -535,12 +517,11 @@ async function checkBouncesForUser(userEmail) {
         continue;
       }
 
-      const info = parseBounce(full, hdrs, userEmail, md.payload); // ✅ Pass payload for DSN parsing
+      const info = parseBounce(full, hdrs, userEmail, md.payload);
       console.log(`  → Parsed: email="${info.email}" reason="${info.reason}" smtp=${info.smtpCode} enh=${info.enhCode}`);
 
       if (info.email) {
         console.log(`🔴 BOUNCE: ${info.email} — ${info.reason}`);
-        // ✅ Use USER token (not service account) — works on all intern sheets!
         await updateBounceWithUserToken(token, user.sheetId, user.sheetTab || 'Sheet1', info.email, info.reason);
         await logEvent({ type:'EMAIL_BOUNCED', email:info.email, campaign:'bounce', url:info.reason });
       } else {
@@ -553,43 +534,12 @@ async function checkBouncesForUser(userEmail) {
   } catch(e) { console.error(`Bounce check error ${userEmail}:`, e.message); }
 }
 
-async function writeBounceReason(sheetId, tab, email, reason) {
-  try {
-    const sheets = await getSheets();
-    const r = await sheets.spreadsheets.values.get({ spreadsheetId:sheetId, range:`${tab}!A1:Z500` });
-    const rows = r.data.values || [];
-    if (rows.length < 2) return;
-    const h  = rows[0].map(h => (h||'').toLowerCase());
-    const ec = h.findIndex(h => h.includes('email'));
-    let   rc = h.findIndex(h => h.includes('bounce reason'));
-    if (rc < 0) {
-      rc = h.length;
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: sheetId,
-        range: `${tab}!${toCol(rc+1)}1`,
-        valueInputOption: 'USER_ENTERED',
-        requestBody: { values: [['Bounce Reason']] }
-      });
-    }
-    for (let i = 1; i < rows.length; i++) {
-      if ((rows[i][ec]||'').toLowerCase().trim() === email.toLowerCase()) {
-        await sheets.spreadsheets.values.update({
-          spreadsheetId: sheetId,
-          range: `${tab}!${toCol(rc+1)}${i+1}`,
-          valueInputOption: 'USER_ENTERED',
-          requestBody: { values: [[reason]] }
-        });
-        break;
-      }
-    }
-  } catch(e) { console.error('writeBounceReason error:', e.message); }
-}
-
-// ✅ Update bounce using USER's own token — works on ALL sheets!
+// ✅ FIX 2: Bounce reason sirf NOTE mein — koi alag column nahi!
+// Merge Status cell ka note: "Bounced on: DD Mon YYYY HH:MM AM\nReason: Invalid Address"
 async function updateBounceWithUserToken(token, sheetId, tab, email, reason) {
   try {
     const sheetTab = tab || 'Sheet1';
-    // Get sheet data
+
     const res = await fetch(
       `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(sheetTab + '!A1:Z500')}`,
       { headers: { Authorization: `Bearer ${token}` } }
@@ -606,22 +556,11 @@ async function updateBounceWithUserToken(token, sheetId, tab, email, reason) {
 
     let statCol = headers.findIndex(h => h.includes('merge status') || h === 'status');
     if (statCol < 0) {
-      // Create Merge Status column
       statCol = headers.length;
       await fetch(
         `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(sheetTab + '!' + toCol(statCol+1) + '1')}?valueInputOption=USER_ENTERED`,
         { method:'PUT', headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' },
           body: JSON.stringify({ values:[['Merge Status']] }) }
-      );
-    }
-
-    let bounceCol = headers.findIndex(h => h.includes('bounce reason'));
-    if (bounceCol < 0) {
-      bounceCol = Math.max(statCol, headers.length);
-      await fetch(
-        `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(sheetTab + '!' + toCol(bounceCol+1) + '1')}?valueInputOption=USER_ENTERED`,
-        { method:'PUT', headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' },
-          body: JSON.stringify({ values:[['Bounce Reason']] }) }
       );
     }
 
@@ -634,7 +573,7 @@ async function updateBounceWithUserToken(token, sheetId, tab, email, reason) {
     }
     if (rowNum < 0) { console.log(`❌ Bounce: ${email} not found in sheet`); return; }
 
-    // Priority check — don't overwrite higher status
+    // Priority check
     const P   = { SCHEDULED:0, EMAIL_SENT:1, EMAIL_OPENED:2, EMAIL_CLICKED:3, EMAIL_BOUNCED:4, UNSUBSCRIBED:5 };
     const cur = ((rows[rowNum-1]||[])[statCol]||'').toUpperCase().trim();
     if ((P[cur]||0) >= (P['EMAIL_BOUNCED']||0)) {
@@ -647,21 +586,14 @@ async function updateBounceWithUserToken(token, sheetId, tab, email, reason) {
       year:'numeric', hour:'2-digit', minute:'2-digit', hour12:true
     });
 
-    // Write EMAIL_BOUNCED status
+    // Write EMAIL_BOUNCED status value
     await fetch(
       `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(sheetTab + '!' + toCol(statCol+1) + rowNum)}?valueInputOption=USER_ENTERED`,
       { method:'PUT', headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' },
         body: JSON.stringify({ values:[['EMAIL_BOUNCED']] }) }
     );
 
-    // Write Bounce Reason
-    await fetch(
-      `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(sheetTab + '!' + toCol(bounceCol+1) + rowNum)}?valueInputOption=USER_ENTERED`,
-      { method:'PUT', headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' },
-        body: JSON.stringify({ values:[[reason]] }) }
-    );
-
-    // Apply color + note via batchUpdate
+    // ✅ FIX 2: Note mein bounce time + reason dono — koi alag column nahi banta!
     try {
       const metaRes = await fetch(
         `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}?fields=sheets.properties`,
@@ -671,8 +603,9 @@ async function updateBounceWithUserToken(token, sheetId, tab, email, reason) {
       const sheetObj = (metaData.sheets||[]).find(s => s.properties.title === sheetTab);
       const gid      = sheetObj?.properties?.sheetId ?? 0;
 
-      const color   = STATUS_COLORS['EMAIL_BOUNCED'];
-      const noteText = `Bounced on: ${nowStr}`;
+      const color    = STATUS_COLORS['EMAIL_BOUNCED'];
+      // ✅ Note mein reason bhi include — "Bounced on: ...\nReason: Invalid Address"
+      const noteText = `Bounced on: ${nowStr}\nReason: ${reason}`;
 
       await fetch(
         `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}:batchUpdate`,
@@ -680,6 +613,7 @@ async function updateBounceWithUserToken(token, sheetId, tab, email, reason) {
           body: JSON.stringify({ requests:[{ updateCells:{
             range:{ sheetId:gid, startRowIndex:rowNum-1, endRowIndex:rowNum, startColumnIndex:statCol, endColumnIndex:statCol+1 },
             rows:[{ values:[{
+              // ✅ Reason note mein, koi extra column nahi!
               note: noteText,
               userEnteredFormat:{ backgroundColor:color, textFormat:{ bold:true, foregroundColor:{red:1,green:1,blue:1} } }
             }]}],
@@ -687,8 +621,8 @@ async function updateBounceWithUserToken(token, sheetId, tab, email, reason) {
           }}]})
         }
       );
-      console.log(`✅ Bounce updated: ${email} → EMAIL_BOUNCED | ${reason}`);
-    } catch(e) { console.error('Bounce color error:', e.message); }
+      console.log(`✅ Bounce updated: ${email} → EMAIL_BOUNCED | Note: ${noteText}`);
+    } catch(e) { console.error('Bounce color/note error:', e.message); }
 
   } catch(e) { console.error('updateBounceWithUserToken error:', e.message); }
 }
@@ -705,7 +639,6 @@ function getEmailBody(payload) {
   return t.slice(0, 10000);
 }
 
-// ✅ Extract DSN delivery-status part specifically (most reliable!)
 function getDsnPart(payload) {
   let dsn = '';
   function ex(p) {
@@ -730,7 +663,6 @@ function parseBounce(text, headers = [], senderEmail = '', payload = null) {
     return true;
   }
 
-  // ── STEP 1: Parse DSN MIME part (most reliable for Gmail bounces) ──
   const dsn = payload ? getDsnPart(payload) : '';
   if (dsn) {
     const finalMatch = dsn.match(/Final-Recipient:\s*rfc822;\s*([^\s\r\n]+)/i);
@@ -747,7 +679,6 @@ function parseBounce(text, headers = [], senderEmail = '', payload = null) {
     }
   }
 
-  // ── STEP 2: Check email headers ────────────────────────────
   if (!email) {
     for (const hdr of headers) {
       const name = (hdr.name || '').toLowerCase();
@@ -762,7 +693,6 @@ function parseBounce(text, headers = [], senderEmail = '', payload = null) {
     }
   }
 
-  // ── STEP 3: DSN patterns in body text ─────────────────────
   if (!email) {
     const patterns = [
       /Final-Recipient:\s*rfc822;\s*([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})/i,
@@ -781,7 +711,6 @@ function parseBounce(text, headers = [], senderEmail = '', payload = null) {
     }
   }
 
-  // ── STEP 4: Scan all emails, pick first non-sender ────────
   if (!email) {
     const all = [...text.matchAll(/([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})/g)];
     for (const m of all) {
@@ -793,13 +722,11 @@ function parseBounce(text, headers = [], senderEmail = '', payload = null) {
     }
   }
 
-  // ── SMTP + Enhanced status codes ──────────────────────────
   const smtpMatch = text.match(/\b(5\d\d|4\d\d)\b/);
   const smtpCode  = smtpMatch ? parseInt(smtpMatch[1]) : 0;
   const enhMatch  = text.match(/\b([45]\.\d\.\d+)\b/);
   const enhCode   = enhMatch ? enhMatch[1] : '';
 
-  // Also get Status from DSN
   let dsnStatus = '';
   if (dsn) {
     const sm = dsn.match(/Status:\s*([45]\.\d+\.\d+)/i);
@@ -848,7 +775,6 @@ function parseBounce(text, headers = [], senderEmail = '', payload = null) {
   return { email, reason, smtpCode, enhCode: effectiveEnh };
 }
 
-
 async function checkAllBounces() {
   const users = Object.keys(userStore);
   if (!users.length) return;
@@ -860,6 +786,7 @@ async function checkAllBounces() {
   }
 }
 
+// ═══════════════════════════════════════════════════════════
 //  ROUTES
 // ═══════════════════════════════════════════════════════════
 app.get('/ping', async (req,res) => {
@@ -867,7 +794,6 @@ app.get('/ping', async (req,res) => {
   checkAllBounces().catch(()=>{});
 });
 
-// 🔍 Manual bounce check endpoint
 app.get('/bounce-check', async (req,res) => {
   if (req.query.key !== process.env.DASHBOARD_KEY) return res.status(401).json({error:'Unauthorized'});
   const users = Object.keys(userStore);
@@ -878,10 +804,9 @@ app.get('/bounce-check', async (req,res) => {
   }
 });
 
-// 🔄 Reset bounce cache — force re-check all bounce emails
 app.get('/bounce-reset', (req,res) => {
   if (req.query.key !== process.env.DASHBOARD_KEY) return res.status(401).json({error:'Unauthorized'});
-  const email = req.query.email; // optional — reset specific user
+  const email = req.query.email;
   let count = 0;
   for (const [u, user] of Object.entries(userStore)) {
     if (email && u !== email.toLowerCase()) continue;
@@ -922,7 +847,6 @@ app.get('/unsubscribe', async (req,res) => {
 
 app.get('/check',(req,res)=>{const k=(req.query.email||'').toLowerCase();const d=trackingStore[k]||{};res.json({opened:!!d.opened,clicked:!!d.clicked});});
 
-// ✅ Save refresh token
 app.post('/auth/save-token', async (req,res) => {
   const {code,redirectUri,userEmail,accessToken,sheetId,sheetTab}=req.body;
   if (!code||!userEmail) return res.status(400).json({error:'Missing fields'});
@@ -931,43 +855,44 @@ app.post('/auth/save-token', async (req,res) => {
     const tr=await fetch('https://oauth2.googleapis.com/token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code,client_id:process.env.OAUTH_CLIENT_ID,client_secret:process.env.OAUTH_CLIENT_SECRET,redirect_uri:redirectUri,grant_type:'authorization_code'})});
     const tokens=await tr.json();
     console.log(`Token status: ${tr.status} | refresh_token: ${!!tokens.refresh_token}`);
-    userStore[userEmail]={refreshToken:tokens.refresh_token||null,accessToken:tokens.access_token||accessToken,sheetId:sheetId||'',sheetTab:sheetTab||'Sheet1',savedAt:new Date().toISOString()};
-    saveUserStore(); // ✅ Write to disk immediately!
+    userStore[userEmail]={
+      refreshToken: tokens.refresh_token||null,
+      accessToken:  tokens.access_token||accessToken,
+      tokenSavedAt: Date.now(), // ✅ FIX 1: Initial tokenSavedAt set karo
+      sheetId:      sheetId||'',
+      sheetTab:     sheetTab||'Sheet1',
+      savedAt:      new Date().toISOString()
+    };
+    saveUserStore();
     console.log(`✅ ${userEmail} saved! has refresh: ${!!tokens.refresh_token}`);
     res.json({success:true,hasRefreshToken:!!tokens.refresh_token});
   } catch(e){console.error('save-token:',e.message);res.status(500).json({error:e.message});}
 });
 
-// ✅ Auto restore session — called every time extension opens
-// No sign out/in needed — just refreshes access token in memory!
 app.post('/auth/restore-session', async (req, res) => {
   const { userEmail, accessToken, sheetId, sheetTab } = req.body;
   if (!userEmail) return res.status(400).json({ error: 'Missing userEmail' });
 
   if (userStore[userEmail]) {
-    // User exists — just update access token + sheet info
     userStore[userEmail].accessToken  = accessToken;
-    userStore[userEmail].tokenSavedAt = Date.now(); // Track when token was saved
+    userStore[userEmail].tokenSavedAt = Date.now(); // ✅ FIX 1: Restore pe bhi time update
     if (sheetId)  userStore[userEmail].sheetId  = sheetId;
     if (sheetTab) userStore[userEmail].sheetTab = sheetTab;
     saveUserStore();
     console.log(`🔄 Session restored for ${userEmail} | sheetId: ${userStore[userEmail].sheetId || 'none'}`);
-    // Trigger bounce check immediately with fresh token!
     checkBouncesForUser(userEmail).catch(e => console.error('Bounce after restore:', e.message));
     return res.json({ restored: true, hasRefreshToken: !!userStore[userEmail].refreshToken });
   } else {
-    // New user — save access token, bounce check will use it
     userStore[userEmail] = {
       refreshToken: null,
       accessToken,
-      tokenSavedAt: Date.now(), // Track when token was saved
+      tokenSavedAt: Date.now(),
       sheetId:  sheetId  || '',
       sheetTab: sheetTab || 'Sheet1',
       savedAt:  new Date().toISOString(),
     };
     saveUserStore();
-    console.log(`✅ Session created for ${userEmail} | sheetId: ${sheetId || 'none'}`);
-    // Trigger bounce check immediately!
+    console.log(`✅ Session created for ${userEmail}`);
     if (sheetId) checkBouncesForUser(userEmail).catch(e => console.error('Bounce on new session:', e.message));
     return res.json({ restored: true, hasRefreshToken: false });
   }
@@ -979,13 +904,12 @@ app.post('/auth/update-sheet',(req,res)=>{
     if(!userStore[userEmail])userStore[userEmail]={};
     if(sheetId)userStore[userEmail].sheetId=sheetId;
     if(sheetTab)userStore[userEmail].sheetTab=sheetTab;
-    saveUserStore(); // ✅ Persist to disk
+    saveUserStore();
     console.log(`📋 Sheet updated for ${userEmail}: ${sheetId}/${sheetTab}`);
   }
   res.json({success:true});
 });
 
-// ✅ SCHEDULING — Persistent! Survives Render restarts!
 app.post('/schedule', async (req,res) => {
   try {
     const {scheduleId,scheduledAt,recipients,draftSubject,draftHtml,
@@ -993,22 +917,18 @@ app.post('/schedule', async (req,res) => {
     if (!scheduledAt||!recipients||!draftHtml)
       return res.status(400).json({error:'Missing fields'});
 
-    // Limits disabled — not on Web Store yet
-    // if (userEmail) { const remaining = getRemainingEmails(userEmail); ... }
-
     const delay = new Date(scheduledAt).getTime() - Date.now();
     if (delay < -60000) return res.status(400).json({error:'Past time'});
 
     const id = scheduleId || ('job_' + Date.now());
 
-    // Save token
     if (userEmail && token) {
       if (!userStore[userEmail]) userStore[userEmail] = { sheetId, sheetTab: sheetTab||'Sheet1' };
-      userStore[userEmail].accessToken = token;
+      userStore[userEmail].accessToken  = token;
+      userStore[userEmail].tokenSavedAt = Date.now(); // ✅ FIX 1
       saveUserStore();
     }
 
-    // ✅ Save job to DISK — survives restarts!
     scheduleStore[id] = {
       id, status:'pending', scheduledAt,
       recipients, draftSubject, draftHtml,
@@ -1017,9 +937,8 @@ app.post('/schedule', async (req,res) => {
     };
     saveScheduleStore();
 
-    console.log(`📅 Job ${id} saved to disk — ${recipients.length} emails at ${scheduledAt}`);
+    console.log(`📅 Job ${id} saved — ${recipients.length} emails at ${scheduledAt}`);
 
-    // Fire after delay
     const actualDelay = Math.max(0, delay);
     setTimeout(() => fireJob(id), actualDelay);
 
@@ -1035,7 +954,6 @@ app.post('/schedule', async (req,res) => {
 
 app.get('/schedule/:id',(req,res)=>{const j=scheduleStore[req.params.id];if(!j)return res.status(404).json({error:'Not found'});res.json({status:j.status,sent:j.sent,total:j.recipients?.length});});
 
-// 📊 Dashboard
 app.get('/dashboard', async (req,res) => {
   if(req.query.key!==process.env.DASHBOARD_KEY)return res.status(401).send('Add ?key=YOUR_PASSWORD');
   try{
@@ -1054,7 +972,6 @@ app.get('/dashboard', async (req,res) => {
   }catch(e){res.status(500).send('Error: '+e.message);}
 });
 
-// ─── User Status (called by extension) ────────────────────
 app.get('/user/status', (req, res) => {
   const email = (req.query.email || '').toLowerCase();
   if (!email) return res.status(400).json({ error: 'Missing email' });
@@ -1066,7 +983,6 @@ app.get('/user/status', (req, res) => {
   res.json({ plan, planName: PLANS[plan]?.name || 'Free', limit, used, remaining, email, hasRefreshToken });
 });
 
-// ─── Check limit before normal (non-scheduled) send ──────
 app.post('/user/check-limit', (req, res) => {
   const { email, count } = req.body;
   if (!email) return res.status(400).json({ error: 'Missing email' });
@@ -1084,19 +1000,17 @@ app.post('/user/check-limit', (req, res) => {
   res.json({ allowed: true, plan, limit, used: getDailyUsage(email), remaining });
 });
 
-// ─── Track send count (called after normal send) ──────────
 app.post('/user/track-send', (req, res) => {
   const { email, count } = req.body;
   if (email) addEmailCount(email, count || 1);
   res.json({ success: true });
 });
 
-// ─── Razorpay — Create Order ──────────────────────────────
 app.post('/payment/create-order', async (req, res) => {
   const { email, months } = req.body;
   if (!email) return res.status(400).json({ error: 'Missing email' });
   const m      = parseInt(months) || 1;
-  const amount = PLANS.paid.price * m * 100; // Razorpay uses paise
+  const amount = PLANS.paid.price * m * 100;
   try {
     const response = await fetch('https://api.razorpay.com/v1/orders', {
       method: 'POST',
@@ -1113,14 +1027,12 @@ app.post('/payment/create-order', async (req, res) => {
   } catch(e) { res.status(500).json({ error: e.message }); }
 });
 
-// ─── Razorpay — Verify Payment ────────────────────────────
 app.post('/payment/verify', async (req, res) => {
   const { email, orderId, paymentId, signature, months } = req.body;
   const crypto = require('crypto');
   const expected = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
     .update(`${orderId}|${paymentId}`).digest('hex');
   if (expected !== signature) return res.status(400).json({ error: 'Invalid signature' });
-  // Activate paid plan
   const m = parseInt(months) || 1;
   const expiresAt = new Date();
   expiresAt.setMonth(expiresAt.getMonth() + m);
@@ -1131,11 +1043,8 @@ app.post('/payment/verify', async (req, res) => {
   res.json({ success: true, plan: 'paid', expiresAt: expiresAt.toISOString() });
 });
 
-// ─── ADMIN ROUTES ──────────────────────────────────────────
 function isAdmin(req) { return req.query.key === process.env.DASHBOARD_KEY || req.headers['x-admin-key'] === process.env.DASHBOARD_KEY; }
 
-// Grant intern/team access
-// ✅ Bulk grant — multiple emails at once
 app.post('/admin/bulk-grant', (req, res) => {
   const { key, emails, plan, months } = req.body;
   if (key !== process.env.DASHBOARD_KEY) return res.status(401).json({ error: 'Unauthorized' });
@@ -1169,7 +1078,6 @@ app.post('/admin/grant', (req, res) => {
   res.json({ success: true, email: e, plan: p, expiresAt });
 });
 
-// Revoke access
 app.post('/admin/revoke', (req, res) => {
   if (!isAdmin(req)) return res.status(401).json({ error: 'Unauthorized' });
   const e = (req.body.email || '').toLowerCase().trim();
@@ -1179,7 +1087,6 @@ app.post('/admin/revoke', (req, res) => {
   res.json({ success: true, email: e, plan: 'free' });
 });
 
-// List all users
 app.get('/admin/users', (req, res) => {
   if (!isAdmin(req)) return res.status(401).json({ error: 'Unauthorized' });
   const users = Object.keys({ ...userStore, ...planStore }).map(email => ({
@@ -1195,7 +1102,6 @@ app.get('/admin/users', (req, res) => {
   res.json({ users, total: users.length });
 });
 
-// ─── ADMIN DASHBOARD (Web UI) ─────────────────────────────
 app.get('/admin', async (req, res) => {
   if (!isAdmin(req)) return res.status(401).send(`
     <html><body style="font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;background:#f8f9fa">
@@ -1270,8 +1176,6 @@ tr:hover td{background:#f8f9fa}
   </div>
 </div>
 <div class="container">
-
-  <!-- Stats -->
   <div class="grid">
     <div class="card green"><div class="num">${totalPaid}</div><div class="lbl">💳 Paid Users</div></div>
     <div class="card blue"><div class="num">${totalIntern}</div><div class="lbl">🎓 Interns (Free Pro)</div></div>
@@ -1282,8 +1186,6 @@ tr:hover td{background:#f8f9fa}
     <div class="card red"><div class="num">${bounces}</div><div class="lbl">🔴 Bounces</div></div>
     <div class="card orange"><div class="num">${unsubs}</div><div class="lbl">🚫 Unsubs</div></div>
   </div>
-
-  <!-- Grant Access -->
   <div class="section">
     <h2>🎓 Grant / Revoke Access</h2>
     <div class="grant-form">
@@ -1305,8 +1207,6 @@ tr:hover td{background:#f8f9fa}
     </div>
     <div id="grantMsg" class="msg"></div>
   </div>
-
-  <!-- Users Table -->
   <div class="section">
     <h2>👥 All Users (${users.length})</h2>
     <table>
@@ -1325,8 +1225,6 @@ tr:hover td{background:#f8f9fa}
       </tr>`).join('')}
     </table>
   </div>
-
-  <!-- Recent Events -->
   <div class="section">
     <h2>📋 Recent Events</h2>
     <table>
@@ -1339,7 +1237,6 @@ tr:hover td{background:#f8f9fa}
     </table>
   </div>
 </div>
-
 <script>
 const KEY = '${adminKey}';
 async function grantAccess() {
@@ -1387,14 +1284,13 @@ function showMsg(text, ok) {
 app.get('/',(req,res)=>res.json({status:'✅ EduJunior v5',users:Object.keys(userStore).length,jobs:Object.keys(scheduleStore).length,time:new Date()}));
 
 // ═══════════════════════════════════════════════════════════
-//  executeScheduledJob — The actual email sender
+//  executeScheduledJob
 // ═══════════════════════════════════════════════════════════
 async function executeScheduledJob(job) {
   const { recipients, draftSubject, draftHtml, sender,
           sheetId, sheetTab, userEmail } = job;
   let sent = 0;
 
-  // Get fresh token
   let activeToken = await getAccessToken(userEmail);
   if (!activeToken) {
     console.log(`❌ No token for ${userEmail} — job failed`);
@@ -1453,16 +1349,13 @@ async function executeScheduledJob(job) {
       } else {
         const err = await sr.text();
         console.log(`❌ ${r.email}: ${err.slice(0,100)}`);
-        // If 401, force refresh and retry this recipient
         if (err.includes('401') || err.includes('Invalid Credentials') || err.includes('invalid_token')) {
           console.log(`🔄 401 detected — refreshing token for ${userEmail}`);
-          // Temporarily clear access token to force refresh
           if (userStore[userEmail]) {
-            userStore[userEmail].tokenSavedAt = 0; // Force expiry
+            userStore[userEmail].tokenSavedAt = 0;
           }
           activeToken = await getAccessToken(userEmail);
           if (activeToken) {
-            // Retry this email
             try {
               const retry = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
                 method:'POST',
@@ -1485,13 +1378,12 @@ async function executeScheduledJob(job) {
 }
 
 // ═══════════════════════════════════════════════════════════
-//  STARTUP — Load schedule store + restore pending jobs
+//  STARTUP
 // ═══════════════════════════════════════════════════════════
 scheduleStore = loadScheduleStore();
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`✅ EduJunior Tracker v5 on port ${PORT}`);
-  // Restore any pending scheduled jobs after restart!
   setTimeout(() => restorePendingJobs(), 3000);
 });
