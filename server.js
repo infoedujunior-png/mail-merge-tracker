@@ -956,15 +956,18 @@ app.post('/auth/restore-session', async (req, res) => {
     checkBouncesForUser(userEmail).catch(e => console.error('Bounce after restore:', e.message));
     return res.json({ restored: true, hasRefreshToken: !!userStore[userEmail].refreshToken });
   } else {
-    // New user — save access token, bounce check will use it
-    userStore[userEmail] = {
-      refreshToken: null,
-      accessToken,
-      tokenSavedAt: Date.now(), // Track when token was saved
-      sheetId:  sheetId  || '',
-      sheetTab: sheetTab || 'Sheet1',
-      savedAt:  new Date().toISOString(),
-    };
+    // Pehle check karein agar purana user exist karta hai
+const existingUser = userStore[userEmail] || {};
+
+userStore[userEmail] = {
+    // Agar naya refresh token aaya to wo lein, nahi to purana wala rakhein, nahi to null
+    refreshToken: tokens.refresh_token || existingUser.refreshToken || null, 
+    accessToken: tokens.access_token || accessToken,
+    sheetId: sheetId || existingUser.sheetId || '',
+    sheetTab: sheetTab || existingUser.sheetTab || 'Sheet1',
+    savedAt: new Date().toISOString()
+};
+
     saveUserStore();
     console.log(`✅ Session created for ${userEmail} | sheetId: ${sheetId || 'none'}`);
     // Trigger bounce check immediately!
