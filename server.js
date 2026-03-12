@@ -1,8 +1,8 @@
 // ═══════════════════════════════════════════════════════════
-//  Mail Merge Tracking Server v5.1 — FIXED
-//  ✅ FIX: Bounce Reason in cell NOTE only — no new column!
-//  ✅ FIX: Schedule works 10-12hr+ with token retry logic
-//  ✅ FIX: Proactive token refresh every 50 emails
+//  Mail Merge Tracking Server v5.0 — FULL 24/7 SOLUTION
+//  ✅ Refresh tokens — schedule 24hr+ later, Chrome closed!
+//  ✅ Server-side bounce detection — no Chrome needed!
+//  ✅ Cell colors, unsubscribe, all tracking working
 // ═══════════════════════════════════════════════════════════
 
 const express = require('express');
@@ -17,7 +17,7 @@ app.use(express.json({ limit: '10mb' }));
 const PIXEL = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7','base64');
 
 const trackingStore = {};
-let scheduleStore   = {};
+let scheduleStore   = {}; // Will be loaded from file after helper functions defined
 let lastBounceCheck = 0;
 
 // ══════════════════════════════════════════════════════════
@@ -32,6 +32,7 @@ function restorePendingJobs() {
     const delay = new Date(job.scheduledAt).getTime() - Date.now();
 
     if (delay < -5 * 60 * 1000) {
+      // Job is more than 5 min overdue — run immediately
       console.log(`⚡ Overdue job ${job.id} — running immediately`);
       scheduleStore[job.id].status = 'running';
       saveScheduleStore();
@@ -48,8 +49,10 @@ function restorePendingJobs() {
         console.log(`❌ Overdue job ${job.id} failed: ${e.message}`);
       });
     } else if (delay <= 0) {
+      // Just overdue — run now
       setImmediate(() => fireJob(job.id));
     } else {
+      // Future job — reschedule
       console.log(`⏰ Re-scheduling job ${job.id} in ${Math.round(delay/60000)} min`);
       setTimeout(() => fireJob(job.id), delay);
     }
@@ -82,12 +85,12 @@ async function fireJob(id) {
 // ══════════════════════════════════════════════════════════
 const PLANS = {
   free:   { dailyLimit: 25,  name: 'Free',       price: 0    },
-  paid:   { dailyLimit: 400, name: 'Pro',         price: 299  },
-  intern: { dailyLimit: 400, name: 'Team (Free)', price: 0    },
+  paid:   { dailyLimit: 400, name: 'Pro',         price: 299  }, // ₹299/month
+  intern: { dailyLimit: 400, name: 'Team (Free)', price: 0    }, // Admin grants free
 };
 
 const PLANS_FILE = path.join('/tmp', 'edujunior_plans.json');
-let planStore = {};
+let planStore = {}; // { email: { plan, expiresAt, razorpaySubId, addedBy, addedAt } }
 
 function loadPlanStore() {
   try {
@@ -99,15 +102,23 @@ function loadPlanStore() {
   } catch(e) { console.error('Load plans error:', e.message); }
   return {};
 }
+
 function savePlanStore() {
-  try { fs.writeFileSync(PLANS_FILE, JSON.stringify(planStore, null, 2)); } catch(e) { console.error('Save plans error:', e.message); }
+  try {
+    fs.writeFileSync(PLANS_FILE, JSON.stringify(planStore, null, 2));
+  } catch(e) { console.error('Save plans error:', e.message); }
 }
+
 planStore = loadPlanStore();
 
+// Daily email count tracking (resets at midnight IST)
 const dailyCountFile = path.join('/tmp', 'edujunior_counts.json');
-let dailyCounts = {};
+let dailyCounts = {}; // { email: { count, date } }
+
 function loadDailyCounts() {
-  try { if (fs.existsSync(dailyCountFile)) return JSON.parse(fs.readFileSync(dailyCountFile, 'utf8')); } catch(e) {}
+  try {
+    if (fs.existsSync(dailyCountFile)) return JSON.parse(fs.readFileSync(dailyCountFile, 'utf8'));
+  } catch(e) {}
   return {};
 }
 function saveDailyCounts() {
@@ -115,36 +126,50 @@ function saveDailyCounts() {
 }
 dailyCounts = loadDailyCounts();
 
-function getTodayIST() { return new Date().toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' }); }
+function getTodayIST() {
+  return new Date().toLocaleDateString('en-IN', { timeZone: 'Asia/Kolkata' });
+}
+
 function getUserPlan(email) {
   const e = (email || '').toLowerCase();
   const p = planStore[e];
   if (!p) return 'free';
+  // Check if paid plan expired
   if (p.plan === 'paid' && p.expiresAt && new Date(p.expiresAt) < new Date()) return 'free';
   return p.plan || 'free';
 }
+
 function getDailyUsage(email) {
   const e = (email || '').toLowerCase();
   const today = getTodayIST();
-  if (!dailyCounts[e] || dailyCounts[e].date !== today) dailyCounts[e] = { count: 0, date: today };
+  if (!dailyCounts[e] || dailyCounts[e].date !== today) {
+    dailyCounts[e] = { count: 0, date: today };
+  }
   return dailyCounts[e].count;
 }
+
 function getRemainingEmails(email) {
-  const plan = getUserPlan(email);
-  return Math.max(0, (PLANS[plan]?.dailyLimit || 25) - getDailyUsage(email));
+  const plan    = getUserPlan(email);
+  const limit   = PLANS[plan]?.dailyLimit || 25;
+  const used    = getDailyUsage(email);
+  return Math.max(0, limit - used);
 }
+
 function addEmailCount(email, count = 1) {
   const e = (email || '').toLowerCase();
   const today = getTodayIST();
-  if (!dailyCounts[e] || dailyCounts[e].date !== today) dailyCounts[e] = { count: 0, date: today };
+  if (!dailyCounts[e] || dailyCounts[e].date !== today) {
+    dailyCounts[e] = { count: 0, date: today };
+  }
   dailyCounts[e].count += count;
   saveDailyCounts();
 }
 
 // ══════════════════════════════════════════════════════════
-//  PERSISTENT TOKEN STORAGE
+//  PERSISTENT TOKEN STORAGE — survives Render restarts! ✅
 // ══════════════════════════════════════════════════════════
 const TOKENS_FILE = path.join('/tmp', 'edujunior_tokens.json');
+
 function loadUserStore() {
   try {
     if (fs.existsSync(TOKENS_FILE)) {
@@ -155,8 +180,10 @@ function loadUserStore() {
   } catch(e) { console.error('Load tokens error:', e.message); }
   return {};
 }
+
 function saveUserStore() {
   try {
+    // Save only essential fields — not processedBounces Set (not serializable)
     const toSave = {};
     for (const [email, user] of Object.entries(userStore)) {
       toSave[email] = {
@@ -171,12 +198,15 @@ function saveUserStore() {
     console.log(`💾 Saved ${Object.keys(toSave).length} users to disk`);
   } catch(e) { console.error('Save tokens error:', e.message); }
 }
+
+// Load on startup
 const userStore = loadUserStore();
 
 // ══════════════════════════════════════════════════════════
-//  PERSISTENT SCHEDULE STORAGE
+//  PERSISTENT SCHEDULE STORAGE — survives Render restarts!
 // ══════════════════════════════════════════════════════════
 const SCHEDULE_FILE = path.join('/tmp', 'edujunior_schedule.json');
+
 function loadScheduleStore() {
   try {
     if (fs.existsSync(SCHEDULE_FILE)) {
@@ -188,10 +218,14 @@ function loadScheduleStore() {
   } catch(e) { console.error('Load schedule error:', e.message); }
   return {};
 }
+
 function saveScheduleStore() {
-  try { fs.writeFileSync(SCHEDULE_FILE, JSON.stringify(scheduleStore, null, 2)); } catch(e) { console.error('Save schedule error:', e.message); }
+  try {
+    fs.writeFileSync(SCHEDULE_FILE, JSON.stringify(scheduleStore, null, 2));
+  } catch(e) { console.error('Save schedule error:', e.message); }
 }
 
+// ── Service Account Sheets ─────────────────────────────────
 async function getSheets() {
   const auth = new google.auth.GoogleAuth({
     credentials: JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON),
@@ -200,55 +234,46 @@ async function getSheets() {
   return google.sheets({ version: 'v4', auth });
 }
 
-// ═══════════════════════════════════════════════════════════
-//  ✅ FIX: getAccessToken — 3 retries + extended fallback
-// ═══════════════════════════════════════════════════════════
+// ✅ REFRESH TOKEN — get new access token anytime
 async function getAccessToken(userEmail) {
   const user = userStore[userEmail];
   if (!user) { console.log(`❌ No user record for ${userEmail}`); return null; }
 
-  // Has refresh token — retry up to 3x for reliability
+  // Has refresh token — always get fresh access token
   if (user.refreshToken) {
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      try {
-        const res = await fetch('https://oauth2.googleapis.com/token', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            client_id:     process.env.OAUTH_CLIENT_ID,
-            client_secret: process.env.OAUTH_CLIENT_SECRET,
-            refresh_token: user.refreshToken,
-            grant_type:    'refresh_token',
-          }),
-        });
-        const data = await res.json();
-        if (data.access_token) {
-          user.accessToken  = data.access_token;
-          user.tokenSavedAt = Date.now();
-          saveUserStore();
-          console.log(`🔑 Fresh token for ${userEmail} (attempt ${attempt})`);
-          return data.access_token;
-        }
-        // ✅ Don't clear refresh token on failure — could be temporary Google error
-        console.error(`❌ Refresh attempt ${attempt} for ${userEmail}: ${data.error}`);
-        if (attempt < 3) await sleep(1500 * attempt);
-      } catch(e) {
-        console.error(`❌ Refresh error attempt ${attempt} for ${userEmail}:`, e.message);
-        if (attempt < 3) await sleep(1500 * attempt);
+    try {
+      const res = await fetch('https://oauth2.googleapis.com/token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          client_id:     process.env.OAUTH_CLIENT_ID,
+          client_secret: process.env.OAUTH_CLIENT_SECRET,
+          refresh_token: user.refreshToken,
+          grant_type:    'refresh_token',
+        }),
+      });
+      const data = await res.json();
+      if (data.access_token) {
+        user.accessToken = data.access_token;
+        user.tokenSavedAt = Date.now();
+        saveUserStore();
+        console.log(`🔑 Fresh token for ${userEmail}`);
+        return data.access_token;
       }
-    }
+      console.error(`❌ Refresh failed for ${userEmail}: ${data.error}`);
+    } catch(e) { console.error(`❌ Refresh error for ${userEmail}:`, e.message); }
   }
 
-  // No refresh token / refresh failed — use access token if < 55 min old
+  // No refresh token — check if access token is still fresh (< 50 min old)
   if (user.accessToken) {
-    const age    = Date.now() - (user.tokenSavedAt || 0);
+    const age = Date.now() - (user.tokenSavedAt || 0);
     const ageMin = Math.round(age / 60000);
-    if (age < 55 * 60 * 1000) {
+    if (age < 50 * 60 * 1000) {
       console.log(`⚡ Using access token for ${userEmail} (${ageMin} min old)`);
       return user.accessToken;
     }
-    console.log(`⚠️ Token expired for ${userEmail} (${ageMin} min old)`);
-    return null;
+    console.log(`⚠️ Token expired for ${userEmail} (${ageMin} min old) — need sign in`);
+    return null; // Token too old — don't use it
   }
 
   console.log(`❌ No token for ${userEmail}`);
@@ -256,10 +281,10 @@ async function getAccessToken(userEmail) {
 }
 
 const STATUS_COLORS = {
-  SCHEDULED:     { red:0.68, green:0.85, blue:0.90 },
+  SCHEDULED:     { red:0.68, green:0.85, blue:0.90 }, // light blue
   EMAIL_SENT:    { red:0.85, green:0.85, blue:0.85 },
-  EMAIL_OPENED:  { red:0.63, green:0.76, blue:0.98 }, // ✅ Fixed: Light Blue (was green)
-  EMAIL_CLICKED: { red:0.18, green:0.46, blue:0.85 },
+  EMAIL_OPENED:  { red:0.72, green:0.94, blue:0.74 },
+  EMAIL_CLICKED: { red:0.20, green:0.66, blue:0.33 },
   EMAIL_BOUNCED: { red:0.96, green:0.40, blue:0.40 },
   UNSUBSCRIBED:  { red:1.00, green:0.76, blue:0.28 },
 };
@@ -267,6 +292,7 @@ const STATUS_COLORS = {
 function toCol(n) { let s=''; while(n>0){const r=(n-1)%26;s=String.fromCharCode(65+r)+s;n=Math.floor((n-1)/26);} return s; }
 function sleep(ms) { return new Promise(r=>setTimeout(r,ms)); }
 
+// ── Update sheet via service account ──────────────────────
 async function updateStatus(sheetId, tab, email, newStatus) {
   if (!sheetId||!email) return;
   const sheetTab = tab||'Sheet1';
@@ -292,6 +318,7 @@ async function updateStatus(sheetId, tab, email, newStatus) {
     if ((P[cur]||0)>=(P[newStatus]||0)) { console.log(`⏭️ Skip ${cur}>=${newStatus}`); return; }
     await sheets.spreadsheets.values.update({ spreadsheetId:sheetId, range:`${sheetTab}!${toCol(statCol+1)}${row}`, valueInputOption:'USER_ENTERED', requestBody:{values:[[newStatus]]} });
 
+    // ✅ Get sheet GID
     let gid = 0;
     try {
       const meta = await sheets.spreadsheets.get({ spreadsheetId:sheetId, fields:'sheets.properties' });
@@ -299,17 +326,28 @@ async function updateStatus(sheetId, tab, email, newStatus) {
       gid = sheetObj?.properties?.sheetId ?? 0;
     } catch(e) { console.log('GID fetch error:', e.message); }
 
+    console.log('GID:', gid, '| row:', row, '| statCol:', statCol);
+
+    // ✅ Use ONE updateCells request — sets BOTH color AND note together
     const color  = STATUS_COLORS[newStatus];
     const isBold = ['EMAIL_CLICKED','EMAIL_BOUNCED'].includes(newStatus);
-    const nowStr = new Date().toLocaleString('en-IN', { timeZone:'Asia/Kolkata', day:'2-digit', month:'short', year:'numeric', hour:'2-digit', minute:'2-digit', hour12:true });
+    const nowStr = new Date().toLocaleString('en-IN', {
+      timeZone:'Asia/Kolkata', day:'2-digit', month:'short',
+      year:'numeric', hour:'2-digit', minute:'2-digit', hour12:true
+    });
     const noteMap = { EMAIL_SENT:'Sent', EMAIL_OPENED:'Opened', EMAIL_CLICKED:'Clicked', EMAIL_BOUNCED:'Bounced', UNSUBSCRIBED:'Unsubscribed' };
     const noteText = (noteMap[newStatus]||newStatus) + ' on: ' + nowStr;
 
-    const cellValue = { note: noteText };
+    const cellValue = {
+      note: noteText,
+    };
     if (color) {
       cellValue.userEnteredFormat = {
         backgroundColor: color,
-        textFormat: { bold: isBold, foregroundColor: isBold ? {red:1,green:1,blue:1} : {red:0.1,green:0.1,blue:0.1} }
+        textFormat: {
+          bold: isBold,
+          foregroundColor: isBold ? {red:1,green:1,blue:1} : {red:0.1,green:0.1,blue:0.1}
+        }
       };
     }
 
@@ -317,18 +355,22 @@ async function updateStatus(sheetId, tab, email, newStatus) {
       const fieldMask = color ? 'note,userEnteredFormat(backgroundColor,textFormat)' : 'note';
       await sheets.spreadsheets.batchUpdate({
         spreadsheetId: sheetId,
-        requestBody: { requests: [{ updateCells: {
-          range: { sheetId:gid, startRowIndex:row-1, endRowIndex:row, startColumnIndex:statCol, endColumnIndex:statCol+1 },
-          rows: [{ values: [cellValue] }],
-          fields: fieldMask,
-        }}]}
+        requestBody: { requests: [{
+          updateCells: {
+            range: { sheetId:gid, startRowIndex:row-1, endRowIndex:row, startColumnIndex:statCol, endColumnIndex:statCol+1 },
+            rows: [{ values: [cellValue] }],
+            fields: fieldMask,
+          }
+        }]}
       });
       console.log('✅ Color+Note OK:', noteText);
-    } catch(e) { console.error('❌ batchUpdate FAILED:', e.message); }
+    } catch(e) { console.error('❌ batchUpdate FAILED:', e.message, JSON.stringify(e.errors||[])); }
+
     console.log(`✅ ${email} → ${newStatus} row ${row}`);
   } catch(e) { console.error(`updateStatus error: ${e.message}`); }
 }
 
+// ── Update sheet via user token ────────────────────────────
 async function updateStatusUserToken(token, sheetId, tab, email, status) {
   const sheetTab=tab||'Sheet1';
   try {
@@ -352,6 +394,7 @@ async function updateStatusUserToken(token, sheetId, tab, email, status) {
     const cur=((rows[row-1]||[])[statCol]||'').toUpperCase().trim();
     if ((P[cur]||0)>=(P[status]||0)) return;
     await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(sheetTab+'!'+toCol(statCol+1)+row)}?valueInputOption=USER_ENTERED`,{method:'PUT',headers:{Authorization:`Bearer ${token}`,'Content-Type':'application/json'},body:JSON.stringify({values:[[status]]})});
+    // ✅ Color + Note via USER TOKEN (same token used for sheet write)
     try {
       const nowStr  = new Date().toLocaleString('en-IN', { timeZone:'Asia/Kolkata', day:'2-digit', month:'short', year:'numeric', hour:'2-digit', minute:'2-digit', hour12:true });
       const noteMap = { EMAIL_SENT:'Sent', EMAIL_OPENED:'Opened', EMAIL_CLICKED:'Clicked', EMAIL_BOUNCED:'Bounced', UNSUBSCRIBED:'Unsubscribed' };
@@ -359,6 +402,7 @@ async function updateStatusUserToken(token, sheetId, tab, email, status) {
       const color    = STATUS_COLORS[status];
       const isBold   = ['EMAIL_CLICKED','EMAIL_BOUNCED'].includes(status);
 
+      // Get GID via user token
       let gid = 0;
       try {
         const metaRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}?fields=sheets.properties`, { headers:{Authorization:`Bearer ${token}`} });
@@ -375,7 +419,9 @@ async function updateStatusUserToken(token, sheetId, tab, email, status) {
         };
       }
       const fieldMask = color ? 'note,userEnteredFormat(backgroundColor,textFormat)' : 'note';
-      await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}:batchUpdate`, {
+
+      // batchUpdate via USER TOKEN
+      const batchRes = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}:batchUpdate`, {
         method: 'POST',
         headers: { Authorization:`Bearer ${token}`, 'Content-Type':'application/json' },
         body: JSON.stringify({ requests: [{ updateCells: {
@@ -384,8 +430,15 @@ async function updateStatusUserToken(token, sheetId, tab, email, status) {
           fields: fieldMask,
         }}]})
       });
-      console.log('✅ Color+Note (user-token):', noteText);
+
+      if (batchRes.ok) {
+        console.log('✅ Color+Note (user-token):', noteText);
+      } else {
+        const errText = await batchRes.text();
+        console.error('❌ Color+Note error:', errText.slice(0,200));
+      }
     } catch(e) { console.error('❌ Color+Note exception:', e.message); }
+
     console.log(`✅ User-token: ${email} → ${status}`);
   } catch(e) { console.error('updateStatusUserToken:', e.message); }
 }
@@ -396,8 +449,11 @@ async function logEvent(e) {
 }
 
 // ═══════════════════════════════════════════════════════════
-//  SERVER-SIDE BOUNCE DETECTION
 // ═══════════════════════════════════════════════════════════
+//  SERVER-SIDE BOUNCE DETECTION — Instant + Scheduled
+// ═══════════════════════════════════════════════════════════
+
+// Run bounce check every 2 minutes automatically (no need for ping!)
 setInterval(() => {
   checkAllBounces().catch(e => console.error('Interval bounce error:', e.message));
 }, 2 * 60 * 1000);
@@ -405,15 +461,20 @@ setInterval(() => {
 async function checkBouncesForUser(userEmail) {
   const user = userStore[userEmail];
   if (!user?.sheetId) { console.log(`⏭️ Skip ${userEmail} — no sheetId`); return; }
+
   const token = await getAccessToken(userEmail);
-  if (!token) { console.log(`⏭️ Skip ${userEmail} — no token`); return; }
+  if (!token) { console.log(`⏭️ Skip ${userEmail} — no token (open extension to refresh)`); return; }
+
   if (!user.processedBounces) user.processedBounces = new Set();
+  // Reset every 2 hrs — ensures failed sheet updates get retried
   if (!user.bouncesResetAt || Date.now() - user.bouncesResetAt > 2*60*60*1000) {
     user.processedBounces = new Set();
     user.bouncesResetAt   = Date.now();
     console.log(`🔄 Reset bounce cache for ${userEmail}`);
   }
+
   try {
+    // Try multiple queries — different mail servers use different senders
     const queries = [
       'from:mailer-daemon newer_than:7d',
       'from:postmaster newer_than:7d',
@@ -422,52 +483,113 @@ async function checkBouncesForUser(userEmail) {
       'subject:"mail delivery failed" newer_than:7d',
       'subject:"failure notice" newer_than:7d',
     ];
+
     const seen = new Set();
     const allMsgs = [];
+
     for (const rawQ of queries) {
       const q = encodeURIComponent(rawQ);
-      const res = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${q}&maxResults=20`,{ headers: { Authorization: `Bearer ${token}` } });
-      if (!res.ok) { console.error(`❌ Gmail API ${res.status} for query: ${rawQ}`); continue; }
+      const res = await fetch(
+        `https://gmail.googleapis.com/gmail/v1/users/me/messages?q=${q}&maxResults=20`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+      if (!res.ok) {
+        console.error(`❌ Gmail API ${res.status} for query: ${rawQ}`);
+        continue;
+      }
       const data = await res.json();
       for (const m of (data.messages || [])) {
         if (!seen.has(m.id)) { seen.add(m.id); allMsgs.push(m); }
       }
     }
+
     console.log(`📧 ${userEmail}: ${allMsgs.length} total bounce candidates`);
     if (!allMsgs.length) return;
+
     for (const msg of allMsgs) {
       if (user.processedBounces.has(msg.id)) continue;
-      const mr = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=full`,{ headers: { Authorization: `Bearer ${token}` } });
+
+      const mr = await fetch(
+        `https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=full`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
       if (!mr.ok) { user.processedBounces.add(msg.id); continue; }
+
       const md      = await mr.json();
       const hdrs    = md.payload?.headers || [];
       const subject = hdrs.find(h => h.name === 'Subject')?.value || '';
       const fromHdr = hdrs.find(h => h.name === 'From')?.value || '';
       const body    = getEmailBody(md.payload);
       const full    = subject + ' ' + fromHdr + ' ' + body;
+
       console.log(`  → Subject: "${subject.slice(0,80)}" | From: "${fromHdr.slice(0,50)}"`);
-      const looksLikeBounce = /mailer.daemon|postmaster|mail.*delivery|delivery.*fail|undeliver|bounce|failure notice|returned mail|address not found|user unknown|rejected|could not deliver/i.test(subject + fromHdr);
-      if (!looksLikeBounce) { user.processedBounces.add(msg.id); continue; }
-      const info = parseBounce(full, hdrs, userEmail, md.payload);
-      console.log(`  → Parsed: email="${info.email}" reason="${info.reason}"`);
+
+      // Must look like a bounce
+      const looksLikeBounce =
+        /mailer.daemon|postmaster|mail.*delivery|delivery.*fail|undeliver|bounce|failure notice|returned mail|address not found|user unknown|rejected|could not deliver/i.test(subject + fromHdr);
+
+      console.log(`  → Subject: "${subject.slice(0,70)}" | Bounce: ${looksLikeBounce}`);
+
+      if (!looksLikeBounce) {
+        user.processedBounces.add(msg.id);
+        continue;
+      }
+
+      const info = parseBounce(full, hdrs, userEmail, md.payload); // ✅ Pass payload for DSN parsing
+      console.log(`  → Parsed: email="${info.email}" reason="${info.reason}" smtp=${info.smtpCode} enh=${info.enhCode}`);
+
       if (info.email) {
         console.log(`🔴 BOUNCE: ${info.email} — ${info.reason}`);
+        // ✅ Use USER token (not service account) — works on all intern sheets!
         await updateBounceWithUserToken(token, user.sheetId, user.sheetTab || 'Sheet1', info.email, info.reason);
         await logEvent({ type:'EMAIL_BOUNCED', email:info.email, campaign:'bounce', url:info.reason });
+      } else {
+        console.log(`  → No email extracted — skipping`);
       }
+
       user.processedBounces.add(msg.id);
       await sleep(300);
     }
   } catch(e) { console.error(`Bounce check error ${userEmail}:`, e.message); }
 }
 
-// ═══════════════════════════════════════════════════════════
-//  ✅ FIX: updateBounceWithUserToken
-//  Bounce reason → cell NOTE only. NO new column created!
-// ═══════════════════════════════════════════════════════════
+async function writeBounceReason(sheetId, tab, email, reason) {
+  try {
+    const sheets = await getSheets();
+    const r = await sheets.spreadsheets.values.get({ spreadsheetId:sheetId, range:`${tab}!A1:Z500` });
+    const rows = r.data.values || [];
+    if (rows.length < 2) return;
+    const h  = rows[0].map(h => (h||'').toLowerCase());
+    const ec = h.findIndex(h => h.includes('email'));
+    let   rc = h.findIndex(h => h.includes('bounce reason'));
+    if (rc < 0) {
+      rc = h.length;
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: sheetId,
+        range: `${tab}!${toCol(rc+1)}1`,
+        valueInputOption: 'USER_ENTERED',
+        requestBody: { values: [['Bounce Reason']] }
+      });
+    }
+    for (let i = 1; i < rows.length; i++) {
+      if ((rows[i][ec]||'').toLowerCase().trim() === email.toLowerCase()) {
+        await sheets.spreadsheets.values.update({
+          spreadsheetId: sheetId,
+          range: `${tab}!${toCol(rc+1)}${i+1}`,
+          valueInputOption: 'USER_ENTERED',
+          requestBody: { values: [[reason]] }
+        });
+        break;
+      }
+    }
+  } catch(e) { console.error('writeBounceReason error:', e.message); }
+}
+
+// ✅ Update bounce using USER's own token — works on ALL sheets!
 async function updateBounceWithUserToken(token, sheetId, tab, email, reason) {
   try {
     const sheetTab = tab || 'Sheet1';
+    // Get sheet data
     const res = await fetch(
       `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(sheetTab + '!A1:Z500')}`,
       { headers: { Authorization: `Bearer ${token}` } }
@@ -484,7 +606,7 @@ async function updateBounceWithUserToken(token, sheetId, tab, email, reason) {
 
     let statCol = headers.findIndex(h => h.includes('merge status') || h === 'status');
     if (statCol < 0) {
-      // Create Merge Status column ONLY — no Bounce Reason column!
+      // Create Merge Status column
       statCol = headers.length;
       await fetch(
         `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(sheetTab + '!' + toCol(statCol+1) + '1')}?valueInputOption=USER_ENTERED`,
@@ -493,44 +615,64 @@ async function updateBounceWithUserToken(token, sheetId, tab, email, reason) {
       );
     }
 
-    // ✅ NO bounceCol — reason goes into cell note ONLY (hover tooltip in Sheets)
+    let bounceCol = headers.findIndex(h => h.includes('bounce reason'));
+    if (bounceCol < 0) {
+      bounceCol = Math.max(statCol, headers.length);
+      await fetch(
+        `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(sheetTab + '!' + toCol(bounceCol+1) + '1')}?valueInputOption=USER_ENTERED`,
+        { method:'PUT', headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' },
+          body: JSON.stringify({ values:[['Bounce Reason']] }) }
+      );
+    }
 
-    // Find recipient row
+    // Find row
     let rowNum = -1;
     for (let i = 1; i < rows.length; i++) {
       if ((rows[i][emailCol]||'').toLowerCase().trim() === email.toLowerCase().trim()) {
         rowNum = i + 1; break;
       }
     }
-    if (rowNum < 0) { console.log(`❌ Bounce: ${email} not found`); return; }
+    if (rowNum < 0) { console.log(`❌ Bounce: ${email} not found in sheet`); return; }
 
-    // Priority check
+    // Priority check — don't overwrite higher status
     const P   = { SCHEDULED:0, EMAIL_SENT:1, EMAIL_OPENED:2, EMAIL_CLICKED:3, EMAIL_BOUNCED:4, UNSUBSCRIBED:5 };
     const cur = ((rows[rowNum-1]||[])[statCol]||'').toUpperCase().trim();
-    if ((P[cur]||0) >= (P['EMAIL_BOUNCED']||0)) { console.log(`⏭️ Skip bounce — current: ${cur}`); return; }
+    if ((P[cur]||0) >= (P['EMAIL_BOUNCED']||0)) {
+      console.log(`⏭️ Skip bounce — current status: ${cur}`);
+      return;
+    }
 
     const nowStr = new Date().toLocaleString('en-IN', {
       timeZone:'Asia/Kolkata', day:'2-digit', month:'short',
       year:'numeric', hour:'2-digit', minute:'2-digit', hour12:true
     });
 
-    // Write EMAIL_BOUNCED to Merge Status (only column touched)
+    // Write EMAIL_BOUNCED status
     await fetch(
       `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(sheetTab + '!' + toCol(statCol+1) + rowNum)}?valueInputOption=USER_ENTERED`,
       { method:'PUT', headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' },
         body: JSON.stringify({ values:[['EMAIL_BOUNCED']] }) }
     );
 
-    // ✅ Reason embedded in cell NOTE — hover over cell to see it. No new column!
+    // Write Bounce Reason
+    await fetch(
+      `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}/values/${encodeURIComponent(sheetTab + '!' + toCol(bounceCol+1) + rowNum)}?valueInputOption=USER_ENTERED`,
+      { method:'PUT', headers:{ Authorization:`Bearer ${token}`, 'Content-Type':'application/json' },
+        body: JSON.stringify({ values:[[reason]] }) }
+    );
+
+    // Apply color + note via batchUpdate
     try {
-      const metaRes  = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${sheetId}?fields=sheets.properties`,{ headers: { Authorization: `Bearer ${token}` } });
+      const metaRes = await fetch(
+        `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}?fields=sheets.properties`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
       const metaData = await metaRes.json();
       const sheetObj = (metaData.sheets||[]).find(s => s.properties.title === sheetTab);
       const gid      = sheetObj?.properties?.sheetId ?? 0;
-      const color    = STATUS_COLORS['EMAIL_BOUNCED'];
 
-      // ✅ Note = timestamp + reason. Hover in Sheets to see reason!
-      const noteText = `Bounced on: ${nowStr}\n📋 Reason: ${reason || 'Delivery Failed'}`;
+      const color   = STATUS_COLORS['EMAIL_BOUNCED'];
+      const noteText = `Bounced on: ${nowStr}`;
 
       await fetch(
         `https://sheets.googleapis.com/v4/spreadsheets/${sheetId}:batchUpdate`,
@@ -545,21 +687,25 @@ async function updateBounceWithUserToken(token, sheetId, tab, email, reason) {
           }}]})
         }
       );
-      console.log(`✅ Bounce: ${email} → EMAIL_BOUNCED | Note: "${reason}"`);
-    } catch(e) { console.error('Bounce note/color error:', e.message); }
+      console.log(`✅ Bounce updated: ${email} → EMAIL_BOUNCED | ${reason}`);
+    } catch(e) { console.error('Bounce color error:', e.message); }
+
   } catch(e) { console.error('updateBounceWithUserToken error:', e.message); }
 }
 
 function getEmailBody(payload) {
   let t = '';
   function ex(p) {
-    if (p?.body?.data) { try { t += Buffer.from(p.body.data, 'base64').toString('utf-8') + '\n'; } catch(e) {} }
+    if (p?.body?.data) {
+      try { t += Buffer.from(p.body.data, 'base64').toString('utf-8') + '\n'; } catch(e) {}
+    }
     if (p?.parts) p.parts.forEach(ex);
   }
   ex(payload);
   return t.slice(0, 10000);
 }
 
+// ✅ Extract DSN delivery-status part specifically (most reliable!)
 function getDsnPart(payload) {
   let dsn = '';
   function ex(p) {
@@ -575,6 +721,7 @@ function getDsnPart(payload) {
 function parseBounce(text, headers = [], senderEmail = '', payload = null) {
   let email = '';
   const senderLower = (senderEmail || '').toLowerCase();
+
   function isValid(addr) {
     const a = (addr || '').toLowerCase().trim();
     if (!a || !a.includes('@') || !a.includes('.')) return false;
@@ -582,24 +729,40 @@ function parseBounce(text, headers = [], senderEmail = '', payload = null) {
     if (/mailer.daemon|postmaster|noreply|no.reply|bounce|return|daemon/i.test(a)) return false;
     return true;
   }
+
+  // ── STEP 1: Parse DSN MIME part (most reliable for Gmail bounces) ──
   const dsn = payload ? getDsnPart(payload) : '';
   if (dsn) {
     const finalMatch = dsn.match(/Final-Recipient:\s*rfc822;\s*([^\s\r\n]+)/i);
-    if (finalMatch?.[1] && isValid(finalMatch[1])) { email = finalMatch[1].replace(/[<>]/g, '').toLowerCase(); }
+    if (finalMatch?.[1] && isValid(finalMatch[1])) {
+      email = finalMatch[1].replace(/[<>]/g, '').toLowerCase();
+      console.log(`  → DSN Final-Recipient: ${email}`);
+    }
     if (!email) {
       const origMatch = dsn.match(/Original-Recipient:\s*rfc822;\s*([^\s\r\n]+)/i);
-      if (origMatch?.[1] && isValid(origMatch[1])) email = origMatch[1].replace(/[<>]/g, '').toLowerCase();
+      if (origMatch?.[1] && isValid(origMatch[1])) {
+        email = origMatch[1].replace(/[<>]/g, '').toLowerCase();
+        console.log(`  → DSN Original-Recipient: ${email}`);
+      }
     }
   }
+
+  // ── STEP 2: Check email headers ────────────────────────────
   if (!email) {
     for (const hdr of headers) {
       const name = (hdr.name || '').toLowerCase();
       if (['x-failed-recipients','x-original-to'].includes(name)) {
         const m = hdr.value?.match(/([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})/);
-        if (m?.[1] && isValid(m[1])) { email = m[1].toLowerCase(); break; }
+        if (m?.[1] && isValid(m[1])) {
+          email = m[1].toLowerCase();
+          console.log(`  → Header "${hdr.name}": ${email}`);
+          break;
+        }
       }
     }
   }
+
+  // ── STEP 3: DSN patterns in body text ─────────────────────
   if (!email) {
     const patterns = [
       /Final-Recipient:\s*rfc822;\s*([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})/i,
@@ -610,43 +773,93 @@ function parseBounce(text, headers = [], senderEmail = '', payload = null) {
     ];
     for (const p of patterns) {
       const m = text.match(p);
-      if (m?.[1] && isValid(m[1])) { email = m[1].toLowerCase(); break; }
+      if (m?.[1] && isValid(m[1])) {
+        email = m[1].toLowerCase();
+        console.log(`  → Body pattern: ${email}`);
+        break;
+      }
     }
   }
+
+  // ── STEP 4: Scan all emails, pick first non-sender ────────
   if (!email) {
     const all = [...text.matchAll(/([a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,})/g)];
-    for (const m of all) { if (isValid(m[1])) { email = m[1].toLowerCase(); break; } }
+    for (const m of all) {
+      if (isValid(m[1])) {
+        email = m[1].toLowerCase();
+        console.log(`  → Fallback scan: ${email}`);
+        break;
+      }
+    }
   }
+
+  // ── SMTP + Enhanced status codes ──────────────────────────
   const smtpMatch = text.match(/\b(5\d\d|4\d\d)\b/);
   const smtpCode  = smtpMatch ? parseInt(smtpMatch[1]) : 0;
   const enhMatch  = text.match(/\b([45]\.\d\.\d+)\b/);
   const enhCode   = enhMatch ? enhMatch[1] : '';
+
+  // Also get Status from DSN
   let dsnStatus = '';
-  if (dsn) { const sm = dsn.match(/Status:\s*([45]\.\d+\.\d+)/i); if (sm) dsnStatus = sm[1]; }
+  if (dsn) {
+    const sm = dsn.match(/Status:\s*([45]\.\d+\.\d+)/i);
+    if (sm) dsnStatus = sm[1];
+  }
   const effectiveEnh = dsnStatus || enhCode;
+
   const b = text.toLowerCase();
   let reason = 'Delivery Failed';
-  if (['5.1.1','5.1.2','5.1.3'].includes(effectiveEnh)||b.includes('user unknown')||b.includes('no such user')||b.includes('does not exist')||b.includes('invalid address')||b.includes('address rejected')||b.includes('unknown user')||b.includes('no mailbox')||b.includes('recipient not found')) { reason = 'Invalid Address'; }
-  else if (['4.2.2','5.2.2'].includes(effectiveEnh)||b.includes('mailbox full')||b.includes('over quota')||b.includes('quota exceeded')||b.includes('storage full')) { reason = 'Mailbox Full'; }
-  else if (effectiveEnh==='5.1.6'||b.includes('account disabled')||b.includes('account suspended')||b.includes('no longer active')||b.includes('deactivated')) { reason = 'Account Disabled'; }
-  else if (['5.4.4'].includes(effectiveEnh)||b.includes('domain not found')||b.includes('no such domain')||b.includes('dns')||b.includes('host not found')) { reason = 'Domain Not Found'; }
-  else if (['5.7.1','5.7.9'].includes(effectiveEnh)||b.includes('spam')||b.includes('policy violation')||b.includes('content rejected')) { reason = 'Message Blocked (Spam)'; }
-  else if (['5.7.0','5.7.26'].includes(effectiveEnh)||b.includes('dmarc')||b.includes('spf')||b.includes('dkim')||b.includes('blacklist')||b.includes('sender blocked')) { reason = 'Sender Blocked'; }
-  else if (smtpCode===550||smtpCode===554||smtpCode===551||b.includes('rejected')||b.includes('permanently rejected')) { reason = 'Message Rejected'; }
-  else if (smtpCode>=400&&smtpCode<500) { reason = 'Temporary Failure (Will Retry)'; }
-  else if (b.includes('relay')||b.includes('not permitted')) { reason = 'Relay Denied'; }
+
+  if (['5.1.1','5.1.2','5.1.3'].includes(effectiveEnh) ||
+      b.includes('user unknown') || b.includes('no such user') ||
+      b.includes('does not exist') || b.includes('invalid address') ||
+      b.includes('address rejected') || b.includes('unknown user') ||
+      b.includes('no mailbox') || b.includes('recipient not found')) {
+    reason = 'Invalid Address';
+  } else if (['4.2.2','5.2.2'].includes(effectiveEnh) ||
+      b.includes('mailbox full') || b.includes('over quota') ||
+      b.includes('quota exceeded') || b.includes('storage full')) {
+    reason = 'Mailbox Full';
+  } else if (effectiveEnh === '5.1.6' ||
+      b.includes('account disabled') || b.includes('account suspended') ||
+      b.includes('no longer active') || b.includes('deactivated')) {
+    reason = 'Account Disabled';
+  } else if (['5.4.4'].includes(effectiveEnh) ||
+      b.includes('domain not found') || b.includes('no such domain') ||
+      b.includes('dns') || b.includes('host not found')) {
+    reason = 'Domain Not Found';
+  } else if (['5.7.1','5.7.9'].includes(effectiveEnh) ||
+      b.includes('spam') || b.includes('policy violation') ||
+      b.includes('content rejected')) {
+    reason = 'Message Blocked (Spam)';
+  } else if (['5.7.0','5.7.26'].includes(effectiveEnh) ||
+      b.includes('dmarc') || b.includes('spf') || b.includes('dkim') ||
+      b.includes('blacklist') || b.includes('sender blocked')) {
+    reason = 'Sender Blocked';
+  } else if (smtpCode === 550 || smtpCode === 554 || smtpCode === 551 ||
+      b.includes('rejected') || b.includes('permanently rejected')) {
+    reason = 'Message Rejected';
+  } else if (smtpCode >= 400 && smtpCode < 500) {
+    reason = 'Temporary Failure (Will Retry)';
+  } else if (b.includes('relay') || b.includes('not permitted')) {
+    reason = 'Relay Denied';
+  }
+
   return { email, reason, smtpCode, enhCode: effectiveEnh };
 }
+
 
 async function checkAllBounces() {
   const users = Object.keys(userStore);
   if (!users.length) return;
   console.log(`🔍 Bounce check for ${users.length} users`);
   lastBounceCheck = Date.now();
-  for (const u of users) { await checkBouncesForUser(u); await sleep(500); }
+  for (const u of users) {
+    await checkBouncesForUser(u);
+    await sleep(500);
+  }
 }
 
-// ═══════════════════════════════════════════════════════════
 //  ROUTES
 // ═══════════════════════════════════════════════════════════
 app.get('/ping', async (req,res) => {
@@ -654,16 +867,21 @@ app.get('/ping', async (req,res) => {
   checkAllBounces().catch(()=>{});
 });
 
+// 🔍 Manual bounce check endpoint
 app.get('/bounce-check', async (req,res) => {
   if (req.query.key !== process.env.DASHBOARD_KEY) return res.status(401).json({error:'Unauthorized'});
   const users = Object.keys(userStore);
   res.json({ message:`Checking ${users.length} users...`, users });
-  for (const u of users) { await checkBouncesForUser(u); await sleep(500); }
+  for (const u of users) {
+    await checkBouncesForUser(u);
+    await sleep(500);
+  }
 });
 
+// 🔄 Reset bounce cache — force re-check all bounce emails
 app.get('/bounce-reset', (req,res) => {
   if (req.query.key !== process.env.DASHBOARD_KEY) return res.status(401).json({error:'Unauthorized'});
-  const email = req.query.email;
+  const email = req.query.email; // optional — reset specific user
   let count = 0;
   for (const [u, user] of Object.entries(userStore)) {
     if (email && u !== email.toLowerCase()) continue;
@@ -672,7 +890,7 @@ app.get('/bounce-reset', (req,res) => {
     count++;
   }
   console.log(`🔄 Bounce cache reset for ${count} users`);
-  res.json({ success:true, reset: count, message: `Cache cleared!` });
+  res.json({ success:true, reset: count, message: `Cache cleared! Next bounce check will re-process all emails.` });
 });
 
 app.get('/track/open', async (req,res) => {
@@ -704,6 +922,7 @@ app.get('/unsubscribe', async (req,res) => {
 
 app.get('/check',(req,res)=>{const k=(req.query.email||'').toLowerCase();const d=trackingStore[k]||{};res.json({opened:!!d.opened,clicked:!!d.clicked});});
 
+// ✅ Save refresh token
 app.post('/auth/save-token', async (req,res) => {
   const {code,redirectUri,userEmail,accessToken,sheetId,sheetTab}=req.body;
   if (!code||!userEmail) return res.status(400).json({error:'Missing fields'});
@@ -712,29 +931,43 @@ app.post('/auth/save-token', async (req,res) => {
     const tr=await fetch('https://oauth2.googleapis.com/token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({code,client_id:process.env.OAUTH_CLIENT_ID,client_secret:process.env.OAUTH_CLIENT_SECRET,redirect_uri:redirectUri,grant_type:'authorization_code'})});
     const tokens=await tr.json();
     console.log(`Token status: ${tr.status} | refresh_token: ${!!tokens.refresh_token}`);
-    userStore[userEmail]={refreshToken:tokens.refresh_token||null,accessToken:tokens.access_token||accessToken,tokenSavedAt:Date.now(),sheetId:sheetId||'',sheetTab:sheetTab||'Sheet1',savedAt:new Date().toISOString()};
-    saveUserStore();
+    userStore[userEmail]={refreshToken:tokens.refresh_token||null,accessToken:tokens.access_token||accessToken,sheetId:sheetId||'',sheetTab:sheetTab||'Sheet1',savedAt:new Date().toISOString()};
+    saveUserStore(); // ✅ Write to disk immediately!
     console.log(`✅ ${userEmail} saved! has refresh: ${!!tokens.refresh_token}`);
     res.json({success:true,hasRefreshToken:!!tokens.refresh_token});
   } catch(e){console.error('save-token:',e.message);res.status(500).json({error:e.message});}
 });
 
+// ✅ Auto restore session — called every time extension opens
+// No sign out/in needed — just refreshes access token in memory!
 app.post('/auth/restore-session', async (req, res) => {
   const { userEmail, accessToken, sheetId, sheetTab } = req.body;
   if (!userEmail) return res.status(400).json({ error: 'Missing userEmail' });
+
   if (userStore[userEmail]) {
+    // User exists — just update access token + sheet info
     userStore[userEmail].accessToken  = accessToken;
-    userStore[userEmail].tokenSavedAt = Date.now();
+    userStore[userEmail].tokenSavedAt = Date.now(); // Track when token was saved
     if (sheetId)  userStore[userEmail].sheetId  = sheetId;
     if (sheetTab) userStore[userEmail].sheetTab = sheetTab;
     saveUserStore();
-    console.log(`🔄 Session restored for ${userEmail}`);
+    console.log(`🔄 Session restored for ${userEmail} | sheetId: ${userStore[userEmail].sheetId || 'none'}`);
+    // Trigger bounce check immediately with fresh token!
     checkBouncesForUser(userEmail).catch(e => console.error('Bounce after restore:', e.message));
     return res.json({ restored: true, hasRefreshToken: !!userStore[userEmail].refreshToken });
   } else {
-    userStore[userEmail] = { refreshToken:null, accessToken, tokenSavedAt:Date.now(), sheetId:sheetId||'', sheetTab:sheetTab||'Sheet1', savedAt:new Date().toISOString() };
+    // New user — save access token, bounce check will use it
+    userStore[userEmail] = {
+      refreshToken: null,
+      accessToken,
+      tokenSavedAt: Date.now(), // Track when token was saved
+      sheetId:  sheetId  || '',
+      sheetTab: sheetTab || 'Sheet1',
+      savedAt:  new Date().toISOString(),
+    };
     saveUserStore();
-    console.log(`✅ Session created for ${userEmail}`);
+    console.log(`✅ Session created for ${userEmail} | sheetId: ${sheetId || 'none'}`);
+    // Trigger bounce check immediately!
     if (sheetId) checkBouncesForUser(userEmail).catch(e => console.error('Bounce on new session:', e.message));
     return res.json({ restored: true, hasRefreshToken: false });
   }
@@ -746,145 +979,63 @@ app.post('/auth/update-sheet',(req,res)=>{
     if(!userStore[userEmail])userStore[userEmail]={};
     if(sheetId)userStore[userEmail].sheetId=sheetId;
     if(sheetTab)userStore[userEmail].sheetTab=sheetTab;
-    saveUserStore();
+    saveUserStore(); // ✅ Persist to disk
     console.log(`📋 Sheet updated for ${userEmail}: ${sheetId}/${sheetTab}`);
   }
   res.json({success:true});
 });
 
+// ✅ SCHEDULING — Persistent! Survives Render restarts!
 app.post('/schedule', async (req,res) => {
   try {
-    const {scheduleId,scheduledAt,recipients,draftSubject,draftHtml,sender,sheetId,sheetTab,userEmail,token} = req.body;
-    if (!scheduledAt||!recipients||!draftHtml) return res.status(400).json({error:'Missing fields'});
+    const {scheduleId,scheduledAt,recipients,draftSubject,draftHtml,
+           sender,sheetId,sheetTab,userEmail,token} = req.body;
+    if (!scheduledAt||!recipients||!draftHtml)
+      return res.status(400).json({error:'Missing fields'});
+
+    // Limits disabled — not on Web Store yet
+    // if (userEmail) { const remaining = getRemainingEmails(userEmail); ... }
+
     const delay = new Date(scheduledAt).getTime() - Date.now();
     if (delay < -60000) return res.status(400).json({error:'Past time'});
+
     const id = scheduleId || ('job_' + Date.now());
+
+    // Save token
     if (userEmail && token) {
       if (!userStore[userEmail]) userStore[userEmail] = { sheetId, sheetTab: sheetTab||'Sheet1' };
-      userStore[userEmail].accessToken  = token;
-      userStore[userEmail].tokenSavedAt = Date.now();
+      userStore[userEmail].accessToken = token;
       saveUserStore();
     }
-    scheduleStore[id] = { id, status:'pending', scheduledAt, recipients, draftSubject, draftHtml, sender, sheetId, sheetTab:sheetTab||'Sheet1', userEmail, createdAt:new Date().toISOString() };
+
+    // ✅ Save job to DISK — survives restarts!
+    scheduleStore[id] = {
+      id, status:'pending', scheduledAt,
+      recipients, draftSubject, draftHtml,
+      sender, sheetId, sheetTab: sheetTab||'Sheet1',
+      userEmail, createdAt: new Date().toISOString()
+    };
     saveScheduleStore();
-    console.log(`📅 Job ${id} saved — ${recipients.length} emails at ${scheduledAt}`);
+
+    console.log(`📅 Job ${id} saved to disk — ${recipients.length} emails at ${scheduledAt}`);
+
+    // Fire after delay
     const actualDelay = Math.max(0, delay);
     setTimeout(() => fireJob(id), actualDelay);
-    res.json({ success:true, id, message:`Scheduled! ${recipients.length} emails at ${new Date(scheduledAt).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})} IST` });
-  } catch(e) { console.error('schedule error:', e.message); res.status(500).json({error:e.message}); }
+
+    res.json({
+      success:true, id,
+      message:`Scheduled! ${recipients.length} emails at ${new Date(scheduledAt).toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})} IST`
+    });
+  } catch(e) {
+    console.error('schedule error:', e.message);
+    res.status(500).json({error:e.message});
+  }
 });
 
 app.get('/schedule/:id',(req,res)=>{const j=scheduleStore[req.params.id];if(!j)return res.status(404).json({error:'Not found'});res.json({status:j.status,sent:j.sent,total:j.recipients?.length});});
 
-app.get('/user/status', (req, res) => {
-  const email = (req.query.email || '').toLowerCase();
-  if (!email) return res.status(400).json({ error: 'Missing email' });
-  const plan           = getUserPlan(email);
-  const limit          = PLANS[plan]?.dailyLimit || 25;
-  const used           = getDailyUsage(email);
-  const remaining      = Math.max(0, limit - used);
-  const hasRefreshToken = !!(userStore[email]?.refreshToken);
-  res.json({ plan, planName: PLANS[plan]?.name || 'Free', limit, used, remaining, email, hasRefreshToken });
-});
-
-app.post('/user/check-limit', (req, res) => {
-  const { email, count } = req.body;
-  if (!email) return res.status(400).json({ error: 'Missing email' });
-  const remaining = getRemainingEmails(email);
-  const plan      = getUserPlan(email);
-  const limit     = PLANS[plan]?.dailyLimit || 25;
-  if ((count || 1) > remaining) {
-    return res.json({ allowed:false, plan, limit, used:getDailyUsage(email), remaining, message: remaining===0 ? 'Daily limit reached!' : `Only ${remaining} emails left today.` });
-  }
-  res.json({ allowed:true, plan, limit, used:getDailyUsage(email), remaining });
-});
-
-app.post('/user/track-send', (req, res) => {
-  const { email, count } = req.body;
-  if (email) addEmailCount(email, count || 1);
-  res.json({ success: true });
-});
-
-app.post('/payment/create-order', async (req, res) => {
-  const { email, months } = req.body;
-  if (!email) return res.status(400).json({ error: 'Missing email' });
-  const m = parseInt(months) || 1;
-  const amount = PLANS.paid.price * m * 100;
-  try {
-    const response = await fetch('https://api.razorpay.com/v1/orders', { method:'POST', headers:{'Content-Type':'application/json','Authorization':'Basic '+Buffer.from(`${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`).toString('base64')}, body:JSON.stringify({amount,currency:'INR',notes:{email,months:m}}) });
-    const order = await response.json();
-    if (!order.id) return res.status(500).json({ error:'Order creation failed', details:order });
-    console.log(`💳 Order: ${order.id} for ${email} — ₹${amount/100}`);
-    res.json({ success:true, orderId:order.id, amount, currency:'INR', keyId:process.env.RAZORPAY_KEY_ID });
-  } catch(e) { res.status(500).json({ error: e.message }); }
-});
-
-app.post('/payment/verify', async (req, res) => {
-  const { email, orderId, paymentId, signature, months } = req.body;
-  const crypto = require('crypto');
-  const expected = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET).update(`${orderId}|${paymentId}`).digest('hex');
-  if (expected !== signature) return res.status(400).json({ error: 'Invalid signature' });
-  const m = parseInt(months) || 1;
-  const expiresAt = new Date(); expiresAt.setMonth(expiresAt.getMonth() + m);
-  const e = email.toLowerCase();
-  planStore[e] = { plan:'paid', expiresAt:expiresAt.toISOString(), paymentId, orderId, activatedAt:new Date().toISOString() };
-  savePlanStore();
-  console.log(`✅ PAID: ${e} — Pro until ${expiresAt.toDateString()}`);
-  res.json({ success:true, plan:'paid', expiresAt:expiresAt.toISOString() });
-});
-
-function isAdmin(req) { return req.query.key === process.env.DASHBOARD_KEY || req.headers['x-admin-key'] === process.env.DASHBOARD_KEY; }
-
-app.post('/admin/bulk-grant', (req, res) => {
-  const { key, emails, plan, months } = req.body;
-  if (key !== process.env.DASHBOARD_KEY) return res.status(401).json({ error: 'Unauthorized' });
-  if (!emails || !Array.isArray(emails)) return res.status(400).json({ error: 'emails array required' });
-  const p = plan || 'intern';
-  let expiresAt = null;
-  if (months) { const d = new Date(); d.setMonth(d.getMonth() + parseInt(months)); expiresAt = d.toISOString(); }
-  const results = [];
-  for (const email of emails) {
-    const e = email.toLowerCase().trim();
-    if (!e) continue;
-    planStore[e] = { plan:p, expiresAt, addedBy:'admin-bulk', addedAt:new Date().toISOString() };
-    results.push(e);
-  }
-  savePlanStore();
-  res.json({ success:true, granted:results.length, plan:p, emails:results });
-});
-
-app.post('/admin/grant', (req, res) => {
-  if (!isAdmin(req)) return res.status(401).json({ error: 'Unauthorized' });
-  const { email, plan, months } = req.body;
-  if (!email) return res.status(400).json({ error: 'Missing email' });
-  const p = plan || 'intern';
-  let expiresAt = null;
-  if (months) { const d = new Date(); d.setMonth(d.getMonth() + months); expiresAt = d.toISOString(); }
-  const e = email.toLowerCase().trim();
-  planStore[e] = { plan:p, expiresAt, addedBy:'admin', addedAt:new Date().toISOString() };
-  savePlanStore();
-  res.json({ success:true, email:e, plan:p, expiresAt });
-});
-
-app.post('/admin/revoke', (req, res) => {
-  if (!isAdmin(req)) return res.status(401).json({ error: 'Unauthorized' });
-  const e = (req.body.email || '').toLowerCase().trim();
-  if (!e) return res.status(400).json({ error: 'Missing email' });
-  planStore[e] = { plan:'free', revokedAt:new Date().toISOString() };
-  savePlanStore();
-  res.json({ success:true, email:e, plan:'free' });
-});
-
-app.get('/admin/users', (req, res) => {
-  if (!isAdmin(req)) return res.status(401).json({ error: 'Unauthorized' });
-  const users = Object.keys({ ...userStore, ...planStore }).map(email => ({
-    email, plan:getUserPlan(email), planName:PLANS[getUserPlan(email)]?.name||'Free',
-    used:getDailyUsage(email), limit:PLANS[getUserPlan(email)]?.dailyLimit||25,
-    remaining:getRemainingEmails(email), expiresAt:planStore[email]?.expiresAt||null, hasToken:!!userStore[email]?.refreshToken,
-  }));
-  res.json({ users, total:users.length });
-});
-
+// 📊 Dashboard
 app.get('/dashboard', async (req,res) => {
   if(req.query.key!==process.env.DASHBOARD_KEY)return res.status(401).send('Add ?key=YOUR_PASSWORD');
   try{
@@ -903,49 +1054,353 @@ app.get('/dashboard', async (req,res) => {
   }catch(e){res.status(500).send('Error: '+e.message);}
 });
 
+// ─── User Status (called by extension) ────────────────────
+app.get('/user/status', (req, res) => {
+  const email = (req.query.email || '').toLowerCase();
+  if (!email) return res.status(400).json({ error: 'Missing email' });
+  const plan           = getUserPlan(email);
+  const limit          = PLANS[plan]?.dailyLimit || 25;
+  const used           = getDailyUsage(email);
+  const remaining      = Math.max(0, limit - used);
+  const hasRefreshToken = !!(userStore[email]?.refreshToken);
+  res.json({ plan, planName: PLANS[plan]?.name || 'Free', limit, used, remaining, email, hasRefreshToken });
+});
+
+// ─── Check limit before normal (non-scheduled) send ──────
+app.post('/user/check-limit', (req, res) => {
+  const { email, count } = req.body;
+  if (!email) return res.status(400).json({ error: 'Missing email' });
+  const remaining = getRemainingEmails(email);
+  const plan      = getUserPlan(email);
+  const limit     = PLANS[plan]?.dailyLimit || 25;
+  if ((count || 1) > remaining) {
+    return res.json({
+      allowed: false, plan, limit, used: getDailyUsage(email), remaining,
+      message: remaining === 0
+        ? 'Daily limit reached! Upgrade to Pro for 400 emails/day.'
+        : `Only ${remaining} emails left today.`
+    });
+  }
+  res.json({ allowed: true, plan, limit, used: getDailyUsage(email), remaining });
+});
+
+// ─── Track send count (called after normal send) ──────────
+app.post('/user/track-send', (req, res) => {
+  const { email, count } = req.body;
+  if (email) addEmailCount(email, count || 1);
+  res.json({ success: true });
+});
+
+// ─── Razorpay — Create Order ──────────────────────────────
+app.post('/payment/create-order', async (req, res) => {
+  const { email, months } = req.body;
+  if (!email) return res.status(400).json({ error: 'Missing email' });
+  const m      = parseInt(months) || 1;
+  const amount = PLANS.paid.price * m * 100; // Razorpay uses paise
+  try {
+    const response = await fetch('https://api.razorpay.com/v1/orders', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Basic ' + Buffer.from(`${process.env.RAZORPAY_KEY_ID}:${process.env.RAZORPAY_KEY_SECRET}`).toString('base64'),
+      },
+      body: JSON.stringify({ amount, currency: 'INR', notes: { email, months: m } }),
+    });
+    const order = await response.json();
+    if (!order.id) return res.status(500).json({ error: 'Order creation failed', details: order });
+    console.log(`💳 Order created: ${order.id} for ${email} — ₹${amount/100}`);
+    res.json({ success: true, orderId: order.id, amount, currency: 'INR', keyId: process.env.RAZORPAY_KEY_ID });
+  } catch(e) { res.status(500).json({ error: e.message }); }
+});
+
+// ─── Razorpay — Verify Payment ────────────────────────────
+app.post('/payment/verify', async (req, res) => {
+  const { email, orderId, paymentId, signature, months } = req.body;
+  const crypto = require('crypto');
+  const expected = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET)
+    .update(`${orderId}|${paymentId}`).digest('hex');
+  if (expected !== signature) return res.status(400).json({ error: 'Invalid signature' });
+  // Activate paid plan
+  const m = parseInt(months) || 1;
+  const expiresAt = new Date();
+  expiresAt.setMonth(expiresAt.getMonth() + m);
+  const e = email.toLowerCase();
+  planStore[e] = { plan: 'paid', expiresAt: expiresAt.toISOString(), paymentId, orderId, activatedAt: new Date().toISOString() };
+  savePlanStore();
+  console.log(`✅ PAID: ${e} — Pro until ${expiresAt.toDateString()}`);
+  res.json({ success: true, plan: 'paid', expiresAt: expiresAt.toISOString() });
+});
+
+// ─── ADMIN ROUTES ──────────────────────────────────────────
+function isAdmin(req) { return req.query.key === process.env.DASHBOARD_KEY || req.headers['x-admin-key'] === process.env.DASHBOARD_KEY; }
+
+// Grant intern/team access
+// ✅ Bulk grant — multiple emails at once
+app.post('/admin/bulk-grant', (req, res) => {
+  const { key, emails, plan, months } = req.body;
+  if (key !== process.env.DASHBOARD_KEY) return res.status(401).json({ error: 'Unauthorized' });
+  if (!emails || !Array.isArray(emails)) return res.status(400).json({ error: 'emails array required' });
+  const p = plan || 'intern';
+  let expiresAt = null;
+  if (months) { const d = new Date(); d.setMonth(d.getMonth() + parseInt(months)); expiresAt = d.toISOString(); }
+  const results = [];
+  for (const email of emails) {
+    const e = email.toLowerCase().trim();
+    if (!e) continue;
+    planStore[e] = { plan: p, expiresAt, addedBy: 'admin-bulk', addedAt: new Date().toISOString() };
+    results.push(e);
+  }
+  savePlanStore();
+  console.log(`✅ Bulk grant: ${results.length} users → ${p}`);
+  res.json({ success: true, granted: results.length, plan: p, emails: results });
+});
+
+app.post('/admin/grant', (req, res) => {
+  if (!isAdmin(req)) return res.status(401).json({ error: 'Unauthorized' });
+  const { email, plan, months } = req.body;
+  if (!email) return res.status(400).json({ error: 'Missing email' });
+  const p = plan || 'intern';
+  let expiresAt = null;
+  if (months) { const d = new Date(); d.setMonth(d.getMonth() + months); expiresAt = d.toISOString(); }
+  const e = email.toLowerCase().trim();
+  planStore[e] = { plan: p, expiresAt, addedBy: 'admin', addedAt: new Date().toISOString() };
+  savePlanStore();
+  console.log(`✅ ADMIN GRANT: ${e} → ${p}`);
+  res.json({ success: true, email: e, plan: p, expiresAt });
+});
+
+// Revoke access
+app.post('/admin/revoke', (req, res) => {
+  if (!isAdmin(req)) return res.status(401).json({ error: 'Unauthorized' });
+  const e = (req.body.email || '').toLowerCase().trim();
+  if (!e) return res.status(400).json({ error: 'Missing email' });
+  planStore[e] = { plan: 'free', revokedAt: new Date().toISOString() };
+  savePlanStore();
+  res.json({ success: true, email: e, plan: 'free' });
+});
+
+// List all users
+app.get('/admin/users', (req, res) => {
+  if (!isAdmin(req)) return res.status(401).json({ error: 'Unauthorized' });
+  const users = Object.keys({ ...userStore, ...planStore }).map(email => ({
+    email,
+    plan:      getUserPlan(email),
+    planName:  PLANS[getUserPlan(email)]?.name || 'Free',
+    used:      getDailyUsage(email),
+    limit:     PLANS[getUserPlan(email)]?.dailyLimit || 25,
+    remaining: getRemainingEmails(email),
+    expiresAt: planStore[email]?.expiresAt || null,
+    hasToken:  !!userStore[email]?.refreshToken,
+  }));
+  res.json({ users, total: users.length });
+});
+
+// ─── ADMIN DASHBOARD (Web UI) ─────────────────────────────
 app.get('/admin', async (req, res) => {
-  if (!isAdmin(req)) return res.status(401).send(`<html><body style="font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;background:#f8f9fa"><div style="text-align:center"><h2>🔐 Admin Access</h2><form onsubmit="location.href='/admin?key='+document.getElementById('k').value;return false"><input id="k" type="password" placeholder="Admin Key" style="padding:10px;border:1px solid #ddd;border-radius:8px;margin:10px"><button style="padding:10px 20px;background:#1a73e8;color:white;border:none;border-radius:8px;cursor:pointer">Login</button></form></div></body></html>`);
+  if (!isAdmin(req)) return res.status(401).send(`
+    <html><body style="font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;background:#f8f9fa">
+    <div style="text-align:center"><h2>🔐 Admin Access</h2>
+    <form onsubmit="location.href='/admin?key='+document.getElementById('k').value;return false">
+    <input id="k" type="password" placeholder="Admin Key" style="padding:10px;border:1px solid #ddd;border-radius:8px;margin:10px">
+    <button style="padding:10px 20px;background:#1a73e8;color:white;border:none;border-radius:8px;cursor:pointer">Login</button>
+    </form></div></body></html>
+  `);
+
   const adminKey = req.query.key;
   const allEmails = [...new Set([...Object.keys(userStore), ...Object.keys(planStore)])];
-  const users = allEmails.map(email => ({ email, plan:getUserPlan(email), planName:PLANS[getUserPlan(email)]?.name||'Free', used:getDailyUsage(email), limit:PLANS[getUserPlan(email)]?.dailyLimit||25, expiresAt:planStore[email]?.expiresAt, hasToken:!!userStore[email]?.refreshToken }));
-  const totalPaid=users.filter(u=>u.plan==='paid').length, totalIntern=users.filter(u=>u.plan==='intern').length, totalFree=users.filter(u=>u.plan==='free').length, revenue=totalPaid*PLANS.paid.price;
+  const users = allEmails.map(email => ({
+    email, plan: getUserPlan(email),
+    planName: PLANS[getUserPlan(email)]?.name || 'Free',
+    used: getDailyUsage(email), limit: PLANS[getUserPlan(email)]?.dailyLimit || 25,
+    expiresAt: planStore[email]?.expiresAt, hasToken: !!userStore[email]?.refreshToken,
+  }));
+
+  const totalPaid = users.filter(u => u.plan === 'paid').length;
+  const totalIntern = users.filter(u => u.plan === 'intern').length;
+  const totalFree = users.filter(u => u.plan === 'free').length;
+  const revenue = totalPaid * PLANS.paid.price;
+
   try {
-    const sheets=await getSheets();
-    const r=await sheets.spreadsheets.values.get({spreadsheetId:process.env.TRACKING_SHEET_ID,range:'Tracking!A:F'});
-    const rows=(r.data.values||[]).slice(1).reverse();
-    const opens=rows.filter(r=>r[1]==='EMAIL_OPENED').length,clicks=rows.filter(r=>r[1]==='EMAIL_CLICKED').length,bounces=rows.filter(r=>r[1]==='EMAIL_BOUNCED').length,unsubs=rows.filter(r=>r[1]==='UNSUBSCRIBED').length;
-    res.send(`<!DOCTYPE html><html><head><title>EduJunior Admin</title><meta name="viewport" content="width=device-width,initial-scale=1"><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f0f2f5;min-height:100vh}.header{background:linear-gradient(135deg,#1a73e8,#0d47a1);color:white;padding:20px 30px;display:flex;align-items:center;gap:12px}.header h1{font-size:20px;font-weight:600}.container{padding:24px;max-width:1200px;margin:0 auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;margin-bottom:24px}.card{background:white;border-radius:14px;padding:20px;box-shadow:0 2px 8px rgba(0,0,0,.06);text-align:center}.card .num{font-size:36px;font-weight:700;line-height:1.1}.card .lbl{font-size:12px;color:#5f6368;margin-top:6px}.green .num{color:#2e7d32}.blue .num{color:#1a73e8}.orange .num{color:#e65100}.red .num{color:#d93025}.purple .num{color:#6a1b9a}.section{background:white;border-radius:14px;padding:20px;box-shadow:0 2px 8px rgba(0,0,0,.06);margin-bottom:20px}.section h2{font-size:15px;font-weight:600;color:#202124;margin-bottom:16px;padding-bottom:10px;border-bottom:1px solid #f1f3f4}.grant-form{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}.grant-form input,.grant-form select{padding:9px 13px;border:1px solid #ddd;border-radius:8px;font-size:13px;flex:1;min-width:180px}.btn{padding:9px 18px;border:none;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600}.btn-blue{background:#1a73e8;color:white}.btn-red{background:#d93025;color:white}table{width:100%;border-collapse:collapse;font-size:13px}th{background:#f8f9fa;color:#5f6368;padding:10px 14px;text-align:left;font-weight:600;border-bottom:2px solid #e8eaed}td{padding:9px 14px;border-bottom:1px solid #f1f3f4;vertical-align:middle}tr:hover td{background:#f8f9fa}.badge{display:inline-block;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600}.badge-paid{background:#e8f5e9;color:#2e7d32}.badge-intern{background:#e3f2fd;color:#1565c0}.badge-free{background:#f5f5f5;color:#757575}.bar-bg{background:#e8eaed;border-radius:4px;height:6px;width:80px;display:inline-block;vertical-align:middle}.bar-fill{background:#1a73e8;border-radius:4px;height:6px}.msg{padding:10px 16px;border-radius:8px;margin-top:10px;font-size:13px;display:none}.msg.ok{background:#e8f5e9;color:#2e7d32}.msg.err{background:#fce8e6;color:#d93025}</style></head><body>
-<div class="header"><div>📊</div><div><h1>EduJunior Mail Merge — Admin Dashboard</h1><div style="font-size:12px;opacity:.8">${new Date().toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})}</div></div></div>
-<div class="container">
-<div class="grid"><div class="card green"><div class="num">${totalPaid}</div><div class="lbl">💳 Paid</div></div><div class="card blue"><div class="num">${totalIntern}</div><div class="lbl">🎓 Interns</div></div><div class="card purple"><div class="num">${totalFree}</div><div class="lbl">🆓 Free</div></div><div class="card green"><div class="num">₹${revenue}</div><div class="lbl">💰 Revenue</div></div><div class="card blue"><div class="num">${opens}</div><div class="lbl">📬 Opens</div></div><div class="card green"><div class="num">${clicks}</div><div class="lbl">🖱️ Clicks</div></div><div class="card red"><div class="num">${bounces}</div><div class="lbl">🔴 Bounces</div></div><div class="card orange"><div class="num">${unsubs}</div><div class="lbl">🚫 Unsubs</div></div></div>
-<div class="section"><h2>🎓 Grant / Revoke Access</h2><div class="grant-form"><input type="email" id="grantEmail" placeholder="intern@email.com"><select id="grantPlan"><option value="intern">Intern (Free Pro)</option><option value="paid">Paid Pro</option><option value="free">Free (Revoke)</option></select><select id="grantMonths"><option value="">Permanent</option><option value="1">1 Month</option><option value="3">3 Months</option><option value="6">6 Months</option><option value="12">1 Year</option></select><button class="btn btn-blue" onclick="grantAccess()">✅ Grant</button><button class="btn btn-red" onclick="revokeAccess()">❌ Revoke</button></div><div id="grantMsg" class="msg"></div></div>
-<div class="section"><h2>👥 All Users (${users.length})</h2><table><tr><th>Email</th><th>Plan</th><th>Usage</th><th>Token</th><th>Expires</th><th>Action</th></tr>${users.map(u=>`<tr><td>${u.email}</td><td><span class="badge badge-${u.plan}">${u.planName}</span></td><td><span style="font-size:12px;color:#5f6368">${u.used}/${u.limit}</span><div class="bar-bg"><div class="bar-fill" style="width:${Math.min(100,u.used/u.limit*100)}%"></div></div></td><td>${u.hasToken?'✅':'⚠️'}</td><td style="font-size:11px;color:#5f6368">${u.expiresAt?new Date(u.expiresAt).toLocaleDateString('en-IN'):'—'}</td><td><button class="btn btn-red" style="padding:4px 10px;font-size:11px" onclick="quickRevoke('${u.email}')">Revoke</button></td></tr>`).join('')}</table></div>
-<div class="section"><h2>📋 Recent Events</h2><table><tr><th>Time</th><th>Event</th><th>Email</th></tr>${rows.slice(0,50).map(r=>`<tr><td style="font-size:11px;color:#5f6368">${r[0]||''}</td><td><span class="badge" style="${{EMAIL_OPENED:'background:#e8f5e9;color:#2e7d32',EMAIL_CLICKED:'background:#1b5e20;color:white',UNSUBSCRIBED:'background:#fce8e6;color:#d93025',EMAIL_BOUNCED:'background:#fff3e0;color:#e65100',EMAIL_SENT:'background:#f1f3f4;color:#5f6368'}[r[1]]||'background:#f1f3f4;color:#333'}">${r[1]||''}</span></td><td>${r[2]||''}</td></tr>`).join('')}</table></div>
+    const sheets = await getSheets();
+    const r = await sheets.spreadsheets.values.get({spreadsheetId:process.env.TRACKING_SHEET_ID,range:'Tracking!A:F'});
+    const rows = (r.data.values||[]).slice(1).reverse();
+    const opens   = rows.filter(r=>r[1]==='EMAIL_OPENED').length;
+    const clicks  = rows.filter(r=>r[1]==='EMAIL_CLICKED').length;
+    const bounces = rows.filter(r=>r[1]==='EMAIL_BOUNCED').length;
+    const unsubs  = rows.filter(r=>r[1]==='UNSUBSCRIBED').length;
+
+    res.send(`<!DOCTYPE html>
+<html><head><title>EduJunior Admin</title><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f0f2f5;min-height:100vh}
+.header{background:linear-gradient(135deg,#1a73e8,#0d47a1);color:white;padding:20px 30px;display:flex;align-items:center;gap:12px}
+.header h1{font-size:20px;font-weight:600}
+.container{padding:24px;max-width:1200px;margin:0 auto}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;margin-bottom:24px}
+.card{background:white;border-radius:14px;padding:20px;box-shadow:0 2px 8px rgba(0,0,0,.06);text-align:center}
+.card .num{font-size:36px;font-weight:700;line-height:1.1}
+.card .lbl{font-size:12px;color:#5f6368;margin-top:6px}
+.green .num{color:#2e7d32} .blue .num{color:#1a73e8} .orange .num{color:#e65100} .red .num{color:#d93025} .purple .num{color:#6a1b9a}
+.section{background:white;border-radius:14px;padding:20px;box-shadow:0 2px 8px rgba(0,0,0,.06);margin-bottom:20px}
+.section h2{font-size:15px;font-weight:600;color:#202124;margin-bottom:16px;padding-bottom:10px;border-bottom:1px solid #f1f3f4}
+.grant-form{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}
+.grant-form input,.grant-form select{padding:9px 13px;border:1px solid #ddd;border-radius:8px;font-size:13px;flex:1;min-width:180px}
+.btn{padding:9px 18px;border:none;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600}
+.btn-blue{background:#1a73e8;color:white} .btn-red{background:#d93025;color:white} .btn-green{background:#2e7d32;color:white}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{background:#f8f9fa;color:#5f6368;padding:10px 14px;text-align:left;font-weight:600;border-bottom:2px solid #e8eaed}
+td{padding:9px 14px;border-bottom:1px solid #f1f3f4;vertical-align:middle}
+tr:hover td{background:#f8f9fa}
+.badge{display:inline-block;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600}
+.badge-paid{background:#e8f5e9;color:#2e7d32}
+.badge-intern{background:#e3f2fd;color:#1565c0}
+.badge-free{background:#f5f5f5;color:#757575}
+.bar-bg{background:#e8eaed;border-radius:4px;height:6px;width:80px;display:inline-block;vertical-align:middle}
+.bar-fill{background:#1a73e8;border-radius:4px;height:6px}
+.msg{padding:10px 16px;border-radius:8px;margin-top:10px;font-size:13px;display:none}
+.msg.ok{background:#e8f5e9;color:#2e7d32} .msg.err{background:#fce8e6;color:#d93025}
+</style></head>
+<body>
+<div class="header">
+  <div>📊</div>
+  <div>
+    <h1>EduJunior Mail Merge — Admin Dashboard</h1>
+    <div style="font-size:12px;opacity:.8">${new Date().toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})}</div>
+  </div>
 </div>
-<script>const KEY='${adminKey}';async function grantAccess(){const email=document.getElementById('grantEmail').value.trim();const plan=document.getElementById('grantPlan').value;const months=document.getElementById('grantMonths').value;if(!email)return showMsg('Enter email!',false);const r=await fetch('/admin/grant?key='+KEY,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,plan,months:months?parseInt(months):null})});const d=await r.json();if(d.success){showMsg('✅ '+email+' → '+plan+' granted!',true);setTimeout(()=>location.reload(),1500);}else showMsg('❌ '+d.error,false);}async function revokeAccess(){const email=document.getElementById('grantEmail').value.trim();if(!email)return showMsg('Enter email!',false);const r=await fetch('/admin/revoke?key='+KEY,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email})});const d=await r.json();if(d.success){showMsg('✅ '+email+' revoked!',true);setTimeout(()=>location.reload(),1500);}else showMsg('❌ '+d.error,false);}async function quickRevoke(email){if(!confirm('Revoke '+email+'?'))return;await fetch('/admin/revoke?key='+KEY,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email})});location.reload();}function showMsg(text,ok){const el=document.getElementById('grantMsg');el.textContent=text;el.className='msg '+(ok?'ok':'err');el.style.display='block';setTimeout(()=>el.style.display='none',3000);}</script></body></html>`);
+<div class="container">
+
+  <!-- Stats -->
+  <div class="grid">
+    <div class="card green"><div class="num">${totalPaid}</div><div class="lbl">💳 Paid Users</div></div>
+    <div class="card blue"><div class="num">${totalIntern}</div><div class="lbl">🎓 Interns (Free Pro)</div></div>
+    <div class="card purple"><div class="num">${totalFree}</div><div class="lbl">🆓 Free Users</div></div>
+    <div class="card green"><div class="num">₹${revenue}</div><div class="lbl">💰 Monthly Revenue</div></div>
+    <div class="card blue"><div class="num">${opens}</div><div class="lbl">📬 Opens</div></div>
+    <div class="card green"><div class="num">${clicks}</div><div class="lbl">🖱️ Clicks</div></div>
+    <div class="card red"><div class="num">${bounces}</div><div class="lbl">🔴 Bounces</div></div>
+    <div class="card orange"><div class="num">${unsubs}</div><div class="lbl">🚫 Unsubs</div></div>
+  </div>
+
+  <!-- Grant Access -->
+  <div class="section">
+    <h2>🎓 Grant / Revoke Access</h2>
+    <div class="grant-form">
+      <input type="email" id="grantEmail" placeholder="intern@email.com">
+      <select id="grantPlan">
+        <option value="intern">Intern (Free Pro)</option>
+        <option value="paid">Paid Pro</option>
+        <option value="free">Free (Revoke)</option>
+      </select>
+      <select id="grantMonths">
+        <option value="">Permanent</option>
+        <option value="1">1 Month</option>
+        <option value="3">3 Months</option>
+        <option value="6">6 Months</option>
+        <option value="12">1 Year</option>
+      </select>
+      <button class="btn btn-blue" onclick="grantAccess()">✅ Grant Access</button>
+      <button class="btn btn-red" onclick="revokeAccess()">❌ Revoke</button>
+    </div>
+    <div id="grantMsg" class="msg"></div>
+  </div>
+
+  <!-- Users Table -->
+  <div class="section">
+    <h2>👥 All Users (${users.length})</h2>
+    <table>
+      <tr><th>Email</th><th>Plan</th><th>Today's Usage</th><th>Token</th><th>Expires</th><th>Action</th></tr>
+      ${users.map(u => `
+      <tr>
+        <td>${u.email}</td>
+        <td><span class="badge badge-${u.plan}">${u.planName}</span></td>
+        <td>
+          <span style="font-size:12px;color:#5f6368">${u.used}/${u.limit}</span>
+          <div class="bar-bg"><div class="bar-fill" style="width:${Math.min(100,u.used/u.limit*100)}%"></div></div>
+        </td>
+        <td>${u.hasToken ? '✅' : '⚠️'}</td>
+        <td style="font-size:11px;color:#5f6368">${u.expiresAt ? new Date(u.expiresAt).toLocaleDateString('en-IN') : '—'}</td>
+        <td><button class="btn btn-red" style="padding:4px 10px;font-size:11px" onclick="quickRevoke('${u.email}')">Revoke</button></td>
+      </tr>`).join('')}
+    </table>
+  </div>
+
+  <!-- Recent Events -->
+  <div class="section">
+    <h2>📋 Recent Events</h2>
+    <table>
+      <tr><th>Time</th><th>Event</th><th>Email</th></tr>
+      ${rows.slice(0,50).map(r=>`<tr>
+        <td style="font-size:11px;color:#5f6368">${r[0]||''}</td>
+        <td><span class="badge" style="${{EMAIL_OPENED:'background:#e8f5e9;color:#2e7d32',EMAIL_CLICKED:'background:#1b5e20;color:white',UNSUBSCRIBED:'background:#fce8e6;color:#d93025',EMAIL_BOUNCED:'background:#fff3e0;color:#e65100',EMAIL_SENT:'background:#f1f3f4;color:#5f6368'}[r[1]]||'background:#f1f3f4;color:#333'}">${r[1]||''}</span></td>
+        <td>${r[2]||''}</td>
+      </tr>`).join('')}
+    </table>
+  </div>
+</div>
+
+<script>
+const KEY = '${adminKey}';
+async function grantAccess() {
+  const email  = document.getElementById('grantEmail').value.trim();
+  const plan   = document.getElementById('grantPlan').value;
+  const months = document.getElementById('grantMonths').value;
+  if (!email) return showMsg('Enter email!', false);
+  const r = await fetch('/admin/grant?key='+KEY, {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ email, plan, months: months ? parseInt(months) : null })
+  });
+  const d = await r.json();
+  if (d.success) { showMsg('✅ ' + email + ' → ' + plan + ' access granted!', true); setTimeout(()=>location.reload(),1500); }
+  else showMsg('❌ ' + d.error, false);
+}
+async function revokeAccess() {
+  const email = document.getElementById('grantEmail').value.trim();
+  if (!email) return showMsg('Enter email!', false);
+  const r = await fetch('/admin/revoke?key='+KEY, {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ email })
+  });
+  const d = await r.json();
+  if (d.success) { showMsg('✅ ' + email + ' revoked!', true); setTimeout(()=>location.reload(),1500); }
+  else showMsg('❌ ' + d.error, false);
+}
+async function quickRevoke(email) {
+  if (!confirm('Revoke ' + email + '?')) return;
+  await fetch('/admin/revoke?key='+KEY, {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({ email })
+  });
+  location.reload();
+}
+function showMsg(text, ok) {
+  const el = document.getElementById('grantMsg');
+  el.textContent = text; el.className = 'msg ' + (ok ? 'ok' : 'err');
+  el.style.display = 'block'; setTimeout(()=>el.style.display='none', 3000);
+}
+</script>
+</body></html>`);
   } catch(e) { res.status(500).send('Error: ' + e.message); }
 });
 
-app.get('/',(req,res)=>res.json({status:'✅ EduJunior v5.1',users:Object.keys(userStore).length,jobs:Object.keys(scheduleStore).length,time:new Date()}));
+app.get('/',(req,res)=>res.json({status:'✅ EduJunior v5',users:Object.keys(userStore).length,jobs:Object.keys(scheduleStore).length,time:new Date()}));
 
 // ═══════════════════════════════════════════════════════════
-//  ✅ FIX: executeScheduledJob — proactive token refresh
+//  executeScheduledJob — The actual email sender
 // ═══════════════════════════════════════════════════════════
 async function executeScheduledJob(job) {
-  const { recipients, draftSubject, draftHtml, sender, sheetId, sheetTab, userEmail } = job;
+  const { recipients, draftSubject, draftHtml, sender,
+          sheetId, sheetTab, userEmail } = job;
   let sent = 0;
 
-  // Pre-job token validation
+  // Get fresh token
   let activeToken = await getAccessToken(userEmail);
   if (!activeToken) {
-    const hasRefresh = !!userStore[userEmail]?.refreshToken;
-    const msg = hasRefresh
-      ? 'Refresh token present but Google rejected it — user must sign in again'
-      : 'No refresh token — user must sign in with extension open for long schedules (>1hr)';
-    console.log(`❌ Cannot start job for ${userEmail}: ${msg}`);
-    throw new Error(msg);
+    console.log(`❌ No token for ${userEmail} — job failed`);
+    throw new Error('No access token available');
   }
-  console.log(`✅ Token ready for ${userEmail} | ${recipients.length} recipients`);
+  console.log(`✅ Token ready for ${userEmail}`);
 
   const serverUrl = 'https://mail-merge-tracker.onrender.com';
   const camp      = encodeURIComponent((draftSubject||'sched') + '_' + Date.now());
@@ -953,34 +1408,37 @@ async function executeScheduledJob(job) {
   const stab      = encodeURIComponent(sheetTab || 'Sheet1');
 
   function wrapHtml(raw) {
-    if (!raw.toLowerCase().includes('<html')) return `<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body>${raw}</body></html>`;
+    if (!raw.toLowerCase().includes('<html'))
+      return `<!DOCTYPE html><html><head><meta charset="UTF-8"></head><body>${raw}</body></html>`;
     if (!raw.toLowerCase().includes('</body>')) return raw + '</body></html>';
     return raw;
   }
 
-  for (let idx = 0; idx < recipients.length; idx++) {
-    const r = recipients[idx];
-
-    // ✅ Proactively refresh every 50 emails (long merges can last many minutes)
-    if (idx > 0 && idx % 50 === 0 && userStore[userEmail]?.refreshToken) {
-      console.log(`🔄 Proactive token refresh at email ${idx}/${recipients.length}`);
-      const freshToken = await getAccessToken(userEmail);
-      if (freshToken) activeToken = freshToken;
-    }
-
+  for (const r of recipients) {
     try {
       let html    = (draftHtml||'').replace(/\{\{(\w[\w\s]*)\}\}/g,(m,k)=>r[k.trim().toLowerCase()]||r[k.trim()]||m);
       let subject = (draftSubject||'').replace(/\{\{(\w[\w\s]*)\}\}/g,(m,k)=>r[k.trim().toLowerCase()]||r[k.trim()]||m);
       html = wrapHtml(html);
+
       const enc      = encodeURIComponent(r.email);
       const unsubUrl = `${serverUrl}/unsubscribe?email=${enc}&campaign=${camp}&sheetId=${sid}&tab=${stab}`;
-      html = html.replace('</body>',`<img src="${serverUrl}/track/open?email=${enc}&campaign=${camp}&sheetId=${sid}&tab=${stab}" width="1" height="1" style="display:none" alt=""/></body>`);
-      html = html.replace(/href="(https?:\/\/[^"]+)"/gi,(m,orig)=>orig.includes(serverUrl)?m:`href="${serverUrl}/track/click?email=${enc}&campaign=${camp}&sheetId=${sid}&tab=${stab}&url=${encodeURIComponent(orig)}"`);
-      html = html.replace('</body>',`<div style="margin-top:28px;padding-top:14px;border-top:1px solid #e8eaed;text-align:center;font-family:Arial,sans-serif;font-size:11px;color:#9aa0a6;"><a href="${unsubUrl}" style="color:#9aa0a6;">Unsubscribe</a></div></body>`);
+      html = html.replace('</body>',
+        `<img src="${serverUrl}/track/open?email=${enc}&campaign=${camp}&sheetId=${sid}&tab=${stab}" width="1" height="1" style="display:none" alt=""/></body>`);
+      html = html.replace(/href="(https?:\/\/[^"]+)"/gi,(m,orig) =>
+        orig.includes(serverUrl) ? m :
+        `href="${serverUrl}/track/click?email=${enc}&campaign=${camp}&sheetId=${sid}&tab=${stab}&url=${encodeURIComponent(orig)}"`);
+      html = html.replace('</body>',
+        `<div style="margin-top:28px;padding-top:14px;border-top:1px solid #e8eaed;text-align:center;font-family:Arial,sans-serif;font-size:11px;color:#9aa0a6;">
+        <a href="${unsubUrl}" style="color:#9aa0a6;">Unsubscribe</a></div></body>`);
 
       const boundary = 'mm_' + Math.random().toString(36).slice(2);
-      const rawEmail = [`From: ${sender}`,`To: ${r.email}`,`Subject: ${subject}`,`MIME-Version: 1.0`,`Content-Type: multipart/alternative; boundary="${boundary}"`,``,`--${boundary}`,`Content-Type: text/html; charset=UTF-8`,``,html,``,`--${boundary}--`].join('\r\n');
-      const encoded  = Buffer.from(rawEmail).toString('base64').replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
+      const rawEmail = [
+        `From: ${sender}`, `To: ${r.email}`, `Subject: ${subject}`,
+        `MIME-Version: 1.0`, `Content-Type: multipart/alternative; boundary="${boundary}"`,
+        ``, `--${boundary}`, `Content-Type: text/html; charset=UTF-8`, ``, html, ``, `--${boundary}--`
+      ].join('\r\n');
+      const encoded = Buffer.from(rawEmail).toString('base64')
+        .replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'');
 
       const sr = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
         method:'POST',
@@ -995,13 +1453,16 @@ async function executeScheduledJob(job) {
       } else {
         const err = await sr.text();
         console.log(`❌ ${r.email}: ${err.slice(0,100)}`);
-        // On 401 — force refresh and retry
-        if (sr.status === 401 || err.includes('invalid_token') || err.includes('Invalid Credentials')) {
-          console.log(`🔄 401 on ${r.email} — forcing refresh`);
-          if (userStore[userEmail]) userStore[userEmail].tokenSavedAt = 0;
-          const refreshed = await getAccessToken(userEmail);
-          if (refreshed) {
-            activeToken = refreshed;
+        // If 401, force refresh and retry this recipient
+        if (err.includes('401') || err.includes('Invalid Credentials') || err.includes('invalid_token')) {
+          console.log(`🔄 401 detected — refreshing token for ${userEmail}`);
+          // Temporarily clear access token to force refresh
+          if (userStore[userEmail]) {
+            userStore[userEmail].tokenSavedAt = 0; // Force expiry
+          }
+          activeToken = await getAccessToken(userEmail);
+          if (activeToken) {
+            // Retry this email
             try {
               const retry = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
                 method:'POST',
@@ -1013,10 +1474,7 @@ async function executeScheduledJob(job) {
                 if (sheetId) await updateStatusUserToken(activeToken, sheetId, sheetTab||'Sheet1', r.email, 'EMAIL_SENT');
                 console.log(`✅ Retry success: ${r.email}`);
               }
-            } catch(retryErr) { console.error(`Retry exception: ${retryErr.message}`); }
-          } else {
-            console.log(`❌ Cannot refresh — stopping job`);
-            break;
+            } catch(retryErr) { console.error(`Retry failed: ${retryErr.message}`); }
           }
         }
       }
@@ -1027,12 +1485,13 @@ async function executeScheduledJob(job) {
 }
 
 // ═══════════════════════════════════════════════════════════
-//  STARTUP
+//  STARTUP — Load schedule store + restore pending jobs
 // ═══════════════════════════════════════════════════════════
 scheduleStore = loadScheduleStore();
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`✅ EduJunior Tracker v5.1 on port ${PORT}`);
+  console.log(`✅ EduJunior Tracker v5 on port ${PORT}`);
+  // Restore any pending scheduled jobs after restart!
   setTimeout(() => restorePendingJobs(), 3000);
 });
