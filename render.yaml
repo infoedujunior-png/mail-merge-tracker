@@ -11,3 +11,11 @@ services:
         sync: false   # Your Google Sheet ID for tracking logs
       - key: DASHBOARD_KEY
         sync: false   # Password to view your dashboard
+      - key: TRACKING_SIGNING_SECRET
+        sync: false   # MUST equal the extension's TRACKING_SIGNING_SECRET (open/click integrity)
+      - key: PROXY_WINDOW_MS
+        value: "12000"  # Hits within this many ms of send = automated (proxy/scanner), not a human open
+      - key: ALLOWED_REDIRECT_HOSTS
+        sync: false   # Optional CSV of allowed click-redirect hosts, e.g. edujr.com,edujuniorolympiad.com
+      - key: SAFE_REDIRECT_URL
+        value: "https://edujr.com"  # Fallback when a click link fails verification
