@@ -9,6 +9,7 @@ const express = require('express');
 const cors    = require('cors');
 const fs      = require('fs');
 const path    = require('path');
+const crypto  = require('crypto');
 const { google } = require('googleapis');
 const app = express();
 app.use(cors());
@@ -19,6 +20,67 @@ const PIXEL = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBR
 const trackingStore = {};
 let scheduleStore   = {};
 let lastBounceCheck = 0;
+
+// ═══════════════════════════════════════════════════════════
+//  TRACKING INTEGRITY + FALSE-POSITIVE SUPPRESSION
+//  This is the core of the open/click false-positive fix.
+// ═══════════════════════════════════════════════════════════
+// Must match the extension's TRACKING_SIGNING_SECRET.
+const TRACKING_SECRET   = process.env.TRACKING_SIGNING_SECRET || '';
+// Hits that arrive within this window after send are treated as automated
+// (Gmail image proxy, Apple MPP, antivirus, link scanners) — recorded raw,
+// NOT counted as a human open/click and NOT written to the recipient sheet.
+const PROXY_WINDOW_MS   = parseInt(process.env.PROXY_WINDOW_MS || '12000', 10);
+// Hosts allowed as click-redirect destinations. Empty = allow any http(s)
+// host that also passes dsig verification. Set to lock down further.
+const ALLOWED_REDIRECT_HOSTS = (process.env.ALLOWED_REDIRECT_HOSTS || '')
+  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+const SAFE_REDIRECT = process.env.SAFE_REDIRECT_URL || 'https://edujr.com';
+
+// Per-tid event memory. NOTE: in-memory → resets on restart/redeploy.
+// For durable unique-counts move this to a DB (see audit report).
+const eventStore = {}; // tid -> { opens:[{at,automated}], clicks:{linkIdx:[{at,automated}]} }
+
+function hmacHex(message) {
+  return crypto.createHmac('sha256', TRACKING_SECRET).update(String(message)).digest('hex');
+}
+// Timing-safe compare of a received hex sig against the expected message.
+function sigValid(received, message) {
+  if (!TRACKING_SECRET || !received) return false;
+  const expected = hmacHex(message);
+  const a = Buffer.from(String(received));
+  const b = Buffer.from(expected);
+  if (a.length !== b.length) return false;
+  try { return crypto.timingSafeEqual(a, b); } catch { return false; }
+}
+// Decide if a tracking hit is a likely-human interaction vs automated.
+// automated = within the proxy window after sentAt, OR a known scanner UA.
+function classifyHit(sentAtRaw, userAgent) {
+  const sentAt = parseInt(sentAtRaw || '0', 10);
+  const ua = (userAgent || '').toLowerCase();
+  const scanner = /googleimageproxy|ggpht|feedfetcher|bot|crawler|spider|scanner|proofpoint|mimecast|barracuda|symantec|forcepoint|microsoft office|safelinks|outlook-iosandroid|preview|monitoring|curl|wget|python-requests|go-http|java\//.test(ua);
+  const withinProxyWindow = sentAt > 0 && (Date.now() - sentAt) < PROXY_WINDOW_MS;
+  return { automated: scanner || withinProxyWindow, scanner, withinProxyWindow };
+}
+// HTML-escape for anything user/recipient-controlled rendered into a page.
+function esc(v) {
+  return String(v == null ? '' : v)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+// Validate a click-redirect destination: http/https only, not localhost/private,
+// and (if configured) within the allow-list of hosts.
+function safeRedirectTarget(rawUrl) {
+  if (!rawUrl) return null;
+  let u;
+  try { u = new URL(decodeURIComponent(rawUrl)); } catch { return null; }
+  if (!/^https?:$/.test(u.protocol)) return null;
+  const host = u.hostname.toLowerCase();
+  if (host === 'localhost' || /^(127\.|10\.|192\.168\.|169\.254\.|0\.)/.test(host) ||
+      /^172\.(1[6-9]|2\d|3[01])\./.test(host)) return null;
+  if (ALLOWED_REDIRECT_HOSTS.length && !ALLOWED_REDIRECT_HOSTS.some(h => host === h || host.endsWith('.'+h))) return null;
+  return u.toString();
+}
 
 // ══════════════════════════════════════════════════════════
 //  RESTORE PENDING JOBS after restart
@@ -676,30 +738,108 @@ app.get('/bounce-reset', (req,res) => {
 });
 
 app.get('/track/open', async (req,res) => {
-  res.set({'Content-Type':'image/gif','Cache-Control':'no-cache,no-store'});res.send(PIXEL);
-  const {email,campaign,sheetId,tab}=req.query; if(!email)return;
-  if(!trackingStore[email.toLowerCase()])trackingStore[email.toLowerCase()]={};
-  trackingStore[email.toLowerCase()].opened=true;
-  updateStatus(sheetId,tab,email,'EMAIL_OPENED').catch(()=>{});
-  logEvent({type:'EMAIL_OPENED',email,campaign}).catch(()=>{});
+  // ALWAYS return the pixel (never break the email), decide recording after.
+  res.set({'Content-Type':'image/gif','Cache-Control':'no-cache,no-store,must-revalidate'});
+  res.send(PIXEL);
+
+  const { email, campaign, sheetId, tab, tid, sig, sentAt } = req.query;
+  if (!email) return;
+
+  // 1) Require a known, validly-signed tracking id. No tid/sig (or bad sig)
+  //    → this is a stray/forged/legacy hit. Record NOTHING. This alone kills
+  //    the "any GET marks opened" class of false positives.
+  if (!tid || !sigValid(sig, `${tid}|${email}|${campaign||''}`)) {
+    console.log(`🚫 open: rejected (bad/missing tid|sig) email=${email}`);
+    return;
+  }
+
+  // 2) Classify: automated (proxy/scanner/instant) vs likely-human.
+  const { automated, scanner, withinProxyWindow } = classifyHit(sentAt, req.get('user-agent'));
+
+  // 3) Dedup per tid. First valid hit initialises the record.
+  const ev = eventStore[tid] || (eventStore[tid] = { opens: [], clicks: {} });
+  const firstHumanAlready = ev.opens.some(o => !o.automated);
+  ev.opens.push({ at: Date.now(), automated });
+
+  if (automated) {
+    // Recorded as raw/automated only — NOT a human open, sheet untouched.
+    console.log(`⚪ open: automated (scanner=${scanner} proxyWin=${withinProxyWindow}) ${email}`);
+    logEvent({ type:'OPEN_AUTOMATED', email, campaign, url: tid }).catch(()=>{});
+    return;
+  }
+
+  // 4) Likely-human open. Mark store + sheet (once) + log once.
+  const key = email.toLowerCase();
+  if (!trackingStore[key]) trackingStore[key] = {};
+  trackingStore[key].opened = true;
+  if (!firstHumanAlready) {
+    console.log(`🟢 open: recorded (human) ${email}`);
+    updateStatus(sheetId, tab, email, 'EMAIL_OPENED').catch(()=>{});
+    logEvent({ type:'EMAIL_OPENED', email, campaign, url: tid }).catch(()=>{});
+  }
 });
 
 app.get('/track/click', async (req,res) => {
-  const {email,campaign,url,sheetId,tab}=req.query;
-  res.redirect(url?decodeURIComponent(url):'https://google.com');
-  if(!email)return;
-  if(!trackingStore[email.toLowerCase()])trackingStore[email.toLowerCase()]={};
-  trackingStore[email.toLowerCase()].clicked=true;
-  updateStatus(sheetId,tab,email,'EMAIL_CLICKED').catch(()=>{});
-  logEvent({type:'EMAIL_CLICKED',email,campaign,url}).catch(()=>{});
+  const { email, campaign, url, sheetId, tab, tid, l, sig, dsig, sentAt } = req.query;
+
+  // 1) Open-redirect defense: only redirect to a destination whose dsig proves
+  //    it was signed for THIS tid, and which is a safe http(s) public host.
+  //    Anything else → neutral safe page (never an attacker-chosen URL).
+  const dsigOk  = tid && dsig && sigValid(dsig, `${tid}|${decodeURIComponent(url||'')}`);
+  const target  = dsigOk ? safeRedirectTarget(url) : null;
+  res.redirect(target || SAFE_REDIRECT);
+
+  if (!email || !tid) return;
+
+  // 2) Require a validly-signed tracking id before recording anything.
+  if (!sigValid(sig, `${tid}|${email}|${campaign||''}`) || !dsigOk) {
+    console.log(`🚫 click: rejected (bad/missing sig/dsig) email=${email}`);
+    return;
+  }
+
+  // 3) Classify automated vs human (scanners/SafeLinks follow links instantly).
+  const { automated, scanner, withinProxyWindow } = classifyHit(sentAt, req.get('user-agent'));
+  const ev = eventStore[tid] || (eventStore[tid] = { opens: [], clicks: {} });
+  const linkIdx = String(l || '0');
+  const hits = ev.clicks[linkIdx] || (ev.clicks[linkIdx] = []);
+  const firstHumanAlready = hits.some(h => !h.automated);
+  hits.push({ at: Date.now(), automated });
+
+  if (automated) {
+    console.log(`⚪ click: automated (scanner=${scanner} proxyWin=${withinProxyWindow}) ${email}`);
+    logEvent({ type:'CLICK_AUTOMATED', email, campaign, url }).catch(()=>{});
+    return;
+  }
+
+  // 4) Likely-human click.
+  const key = email.toLowerCase();
+  if (!trackingStore[key]) trackingStore[key] = {};
+  trackingStore[key].clicked = true;
+  if (!firstHumanAlready) {
+    console.log(`🟢 click: recorded (human) ${email}`);
+    updateStatus(sheetId, tab, email, 'EMAIL_CLICKED').catch(()=>{});
+    logEvent({ type:'EMAIL_CLICKED', email, campaign, url }).catch(()=>{});
+  }
 });
 
-app.get('/unsubscribe', async (req,res) => {
-  const {email,campaign,sheetId,tab}=req.query;
-  console.log(`🚫 UNSUBSCRIBE: ${email}`);
-  await updateStatus(sheetId,tab,email,'UNSUBSCRIBED');
-  await logEvent({type:'UNSUBSCRIBED',email,campaign});
-  res.send(`<!DOCTYPE html><html><head><title>Unsubscribed</title><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,sans-serif;background:#f8f9fa;display:flex;align-items:center;justify-content:center;min-height:100vh}.card{background:white;border-radius:16px;padding:48px;text-align:center;max-width:420px;box-shadow:0 4px 24px rgba(0,0,0,.08)}.icon{font-size:52px;margin-bottom:16px}h1{font-size:22px;color:#202124;margin-bottom:10px}p{font-size:14px;color:#5f6368;line-height:1.7}.em{font-weight:600;color:#1a73e8}</style></head><body><div class="card"><div class="icon">✅</div><h1>Successfully Unsubscribed</h1><p>The address <span class="em">${email||'your email'}</span> has been removed.</p></div></body></html>`);
+// GET shows a CONFIRM page (no action) — this prevents email security scanners
+// that auto-follow links from silently unsubscribing real recipients.
+app.get('/unsubscribe', (req,res) => {
+  const { email, campaign, sheetId, tab } = req.query;
+  const e = esc(email || 'your email');
+  const j = esc(JSON.stringify({ email: email||'', campaign: campaign||'', sheetId: sheetId||'', tab: tab||'' }));
+  res.send(`<!DOCTYPE html><html><head><title>Unsubscribe</title><meta name="viewport" content="width=device-width,initial-scale=1"><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,sans-serif;background:#f8f9fa;display:flex;align-items:center;justify-content:center;min-height:100vh}.card{background:white;border-radius:16px;padding:48px;text-align:center;max-width:420px;box-shadow:0 4px 24px rgba(0,0,0,.08)}.icon{font-size:52px;margin-bottom:16px}h1{font-size:22px;color:#202124;margin-bottom:10px}p{font-size:14px;color:#5f6368;line-height:1.7;margin-bottom:20px}.em{font-weight:600;color:#1a73e8}button{padding:11px 22px;background:#d93025;color:#fff;border:none;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer}</style></head><body><div class="card"><div class="icon">✉️</div><h1>Unsubscribe?</h1><p>Confirm removing <span class="em">${e}</span> from this mailing list.</p><button id="b">Confirm Unsubscribe</button><p id="m" style="display:none;margin-top:16px"></p></div>
+<script>var D=${j};document.getElementById('b').onclick=function(){fetch('/unsubscribe',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(D)}).then(function(r){return r.json()}).then(function(){document.getElementById('b').style.display='none';var m=document.getElementById('m');m.style.display='block';m.textContent='✅ You have been unsubscribed.'}).catch(function(){var m=document.getElementById('m');m.style.display='block';m.textContent='Something went wrong, please try again.'})};</script></body></html>`);
+});
+
+// POST performs the actual suppression (real human confirmation).
+app.post('/unsubscribe', async (req,res) => {
+  const { email, campaign, sheetId, tab } = req.body || {};
+  if (!email) return res.status(400).json({ error:'Missing email' });
+  console.log(`🚫 UNSUBSCRIBE (confirmed): ${email}`);
+  await updateStatus(sheetId, tab, email, 'UNSUBSCRIBED');
+  await logEvent({ type:'UNSUBSCRIBED', email, campaign });
+  res.json({ success:true });
 });
 
 app.get('/check',(req,res)=>{const k=(req.query.email||'').toLowerCase();const d=trackingStore[k]||{};res.json({opened:!!d.opened,clicked:!!d.clicked});});
@@ -891,15 +1031,17 @@ app.get('/dashboard', async (req,res) => {
     const sheets=await getSheets();
     const r=await sheets.spreadsheets.values.get({spreadsheetId:process.env.TRACKING_SHEET_ID,range:'Tracking!A:F'});
     const rows=(r.data.values||[]).slice(1).reverse();
-    const opens=rows.filter(r=>r[1]==='EMAIL_OPENED').length;
-    const clicks=rows.filter(r=>r[1]==='EMAIL_CLICKED').length;
-    const unsubs=rows.filter(r=>r[1]==='UNSUBSCRIBED').length;
-    const bounces=rows.filter(r=>r[1]==='EMAIL_BOUNCED').length;
+    // UNIQUE human metrics (distinct recipient), automated hits excluded.
+    const uniq = t => new Set(rows.filter(r=>r[1]===t).map(r=>(r[2]||'').toLowerCase())).size;
+    const opens=uniq('EMAIL_OPENED');
+    const clicks=uniq('EMAIL_CLICKED');
+    const unsubs=uniq('UNSUBSCRIBED');
+    const bounces=uniq('EMAIL_BOUNCED');
     const BADGE={EMAIL_OPENED:'background:#e8f5e9;color:#2e7d32',EMAIL_CLICKED:'background:#1b5e20;color:white',UNSUBSCRIBED:'background:#fce8e6;color:#d93025',EMAIL_BOUNCED:'background:#fff3e0;color:#e65100',EMAIL_SENT:'background:#f1f3f4;color:#5f6368'};
     res.send(`<!DOCTYPE html><html><head><title>EduJunior Dashboard</title><meta name="viewport" content="width=device-width,initial-scale=1"><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,sans-serif;background:#f8f9fa;padding:24px}h1{font-size:22px;color:#202124;margin-bottom:4px}.sub{font-size:12px;color:#5f6368;margin-bottom:20px}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:22px}.stat{background:white;border-radius:12px;padding:18px;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.06)}.n{font-size:38px;font-weight:700;line-height:1}.l{font-size:11px;color:#5f6368;margin-top:6px}.o .n{color:#2e7d32}.c .n{color:#1b5e20}.b .n{color:#e65100}.u .n{color:#d93025}table{width:100%;border-collapse:collapse;background:white;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,.06)}th{background:#1a73e8;color:white;padding:10px 14px;text-align:left;font-size:12px}td{padding:8px 14px;font-size:12px;border-bottom:1px solid #f1f3f4}.badge{display:inline-block;padding:3px 9px;border-radius:10px;font-size:11px;font-weight:600}</style></head><body>
     <h1>📊 EduJunior Mail Merge</h1><div class="sub">Users: ${Object.keys(userStore).length} | Jobs: ${Object.keys(scheduleStore).length}</div>
     <div class="stats"><div class="stat o"><div class="n">${opens}</div><div class="l">📬 Opened</div></div><div class="stat c"><div class="n">${clicks}</div><div class="l">🖱️ Clicked</div></div><div class="stat b"><div class="n">${bounces}</div><div class="l">🔴 Bounced</div></div><div class="stat u"><div class="n">${unsubs}</div><div class="l">🚫 Unsub</div></div></div>
-    <table><tr><th>Time</th><th>Event</th><th>Email</th><th>Campaign</th></tr>${rows.slice(0,150).map(r=>{const st=BADGE[r[1]]||'background:#f1f3f4;color:#5f6368';return`<tr><td>${r[0]||''}</td><td><span class="badge" style="${st}">${r[1]||''}</span></td><td>${r[2]||''}</td><td>${r[3]||''}</td></tr>`;}).join('')}</table></body></html>`);
+    <table><tr><th>Time</th><th>Event</th><th>Email</th><th>Campaign</th></tr>${rows.slice(0,150).map(r=>{const st=BADGE[r[1]]||'background:#f1f3f4;color:#5f6368';return`<tr><td>${esc(r[0])}</td><td><span class="badge" style="${st}">${esc(r[1])}</span></td><td>${esc(r[2])}</td><td>${esc(r[3])}</td></tr>`;}).join('')}</table></body></html>`);
   }catch(e){res.status(500).send('Error: '+e.message);}
 });
 
@@ -913,14 +1055,15 @@ app.get('/admin', async (req, res) => {
     const sheets=await getSheets();
     const r=await sheets.spreadsheets.values.get({spreadsheetId:process.env.TRACKING_SHEET_ID,range:'Tracking!A:F'});
     const rows=(r.data.values||[]).slice(1).reverse();
-    const opens=rows.filter(r=>r[1]==='EMAIL_OPENED').length,clicks=rows.filter(r=>r[1]==='EMAIL_CLICKED').length,bounces=rows.filter(r=>r[1]==='EMAIL_BOUNCED').length,unsubs=rows.filter(r=>r[1]==='UNSUBSCRIBED').length;
+    const uniq=t=>new Set(rows.filter(r=>r[1]===t).map(r=>(r[2]||'').toLowerCase())).size;
+    const opens=uniq('EMAIL_OPENED'),clicks=uniq('EMAIL_CLICKED'),bounces=uniq('EMAIL_BOUNCED'),unsubs=uniq('UNSUBSCRIBED');
     res.send(`<!DOCTYPE html><html><head><title>EduJunior Admin</title><meta name="viewport" content="width=device-width,initial-scale=1"><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f0f2f5;min-height:100vh}.header{background:linear-gradient(135deg,#1a73e8,#0d47a1);color:white;padding:20px 30px;display:flex;align-items:center;gap:12px}.header h1{font-size:20px;font-weight:600}.container{padding:24px;max-width:1200px;margin:0 auto}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px;margin-bottom:24px}.card{background:white;border-radius:14px;padding:20px;box-shadow:0 2px 8px rgba(0,0,0,.06);text-align:center}.card .num{font-size:36px;font-weight:700;line-height:1.1}.card .lbl{font-size:12px;color:#5f6368;margin-top:6px}.green .num{color:#2e7d32}.blue .num{color:#1a73e8}.orange .num{color:#e65100}.red .num{color:#d93025}.purple .num{color:#6a1b9a}.section{background:white;border-radius:14px;padding:20px;box-shadow:0 2px 8px rgba(0,0,0,.06);margin-bottom:20px}.section h2{font-size:15px;font-weight:600;color:#202124;margin-bottom:16px;padding-bottom:10px;border-bottom:1px solid #f1f3f4}.grant-form{display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end}.grant-form input,.grant-form select{padding:9px 13px;border:1px solid #ddd;border-radius:8px;font-size:13px;flex:1;min-width:180px}.btn{padding:9px 18px;border:none;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600}.btn-blue{background:#1a73e8;color:white}.btn-red{background:#d93025;color:white}table{width:100%;border-collapse:collapse;font-size:13px}th{background:#f8f9fa;color:#5f6368;padding:10px 14px;text-align:left;font-weight:600;border-bottom:2px solid #e8eaed}td{padding:9px 14px;border-bottom:1px solid #f1f3f4;vertical-align:middle}tr:hover td{background:#f8f9fa}.badge{display:inline-block;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600}.badge-paid{background:#e8f5e9;color:#2e7d32}.badge-intern{background:#e3f2fd;color:#1565c0}.badge-free{background:#f5f5f5;color:#757575}.bar-bg{background:#e8eaed;border-radius:4px;height:6px;width:80px;display:inline-block;vertical-align:middle}.bar-fill{background:#1a73e8;border-radius:4px;height:6px}.msg{padding:10px 16px;border-radius:8px;margin-top:10px;font-size:13px;display:none}.msg.ok{background:#e8f5e9;color:#2e7d32}.msg.err{background:#fce8e6;color:#d93025}</style></head><body>
 <div class="header"><div>📊</div><div><h1>EduJunior Mail Merge — Admin Dashboard</h1><div style="font-size:12px;opacity:.8">${new Date().toLocaleString('en-IN',{timeZone:'Asia/Kolkata'})}</div></div></div>
 <div class="container">
 <div class="grid"><div class="card green"><div class="num">${totalPaid}</div><div class="lbl">💳 Paid</div></div><div class="card blue"><div class="num">${totalIntern}</div><div class="lbl">🎓 Interns</div></div><div class="card purple"><div class="num">${totalFree}</div><div class="lbl">🆓 Free</div></div><div class="card green"><div class="num">₹${revenue}</div><div class="lbl">💰 Revenue</div></div><div class="card blue"><div class="num">${opens}</div><div class="lbl">📬 Opens</div></div><div class="card green"><div class="num">${clicks}</div><div class="lbl">🖱️ Clicks</div></div><div class="card red"><div class="num">${bounces}</div><div class="lbl">🔴 Bounces</div></div><div class="card orange"><div class="num">${unsubs}</div><div class="lbl">🚫 Unsubs</div></div></div>
 <div class="section"><h2>🎓 Grant / Revoke Access</h2><div class="grant-form"><input type="email" id="grantEmail" placeholder="intern@email.com"><select id="grantPlan"><option value="intern">Intern (Free Pro)</option><option value="paid">Paid Pro</option><option value="free">Free (Revoke)</option></select><select id="grantMonths"><option value="">Permanent</option><option value="1">1 Month</option><option value="3">3 Months</option><option value="6">6 Months</option><option value="12">1 Year</option></select><button class="btn btn-blue" onclick="grantAccess()">✅ Grant</button><button class="btn btn-red" onclick="revokeAccess()">❌ Revoke</button></div><div id="grantMsg" class="msg"></div></div>
-<div class="section"><h2>👥 All Users (${users.length})</h2><table><tr><th>Email</th><th>Plan</th><th>Usage</th><th>Token</th><th>Expires</th><th>Action</th></tr>${users.map(u=>`<tr><td>${u.email}</td><td><span class="badge badge-${u.plan}">${u.planName}</span></td><td><span style="font-size:12px;color:#5f6368">${u.used}/${u.limit}</span><div class="bar-bg"><div class="bar-fill" style="width:${Math.min(100,u.used/u.limit*100)}%"></div></div></td><td>${u.hasToken?'✅':'⚠️'}</td><td style="font-size:11px;color:#5f6368">${u.expiresAt?new Date(u.expiresAt).toLocaleDateString('en-IN'):'—'}</td><td><button class="btn btn-red" style="padding:4px 10px;font-size:11px" onclick="quickRevoke('${u.email}')">Revoke</button></td></tr>`).join('')}</table></div>
-<div class="section"><h2>📋 Recent Events</h2><table><tr><th>Time</th><th>Event</th><th>Email</th></tr>${rows.slice(0,50).map(r=>`<tr><td style="font-size:11px;color:#5f6368">${r[0]||''}</td><td><span class="badge" style="${{EMAIL_OPENED:'background:#e8f5e9;color:#2e7d32',EMAIL_CLICKED:'background:#1b5e20;color:white',UNSUBSCRIBED:'background:#fce8e6;color:#d93025',EMAIL_BOUNCED:'background:#fff3e0;color:#e65100',EMAIL_SENT:'background:#f1f3f4;color:#5f6368'}[r[1]]||'background:#f1f3f4;color:#333'}">${r[1]||''}</span></td><td>${r[2]||''}</td></tr>`).join('')}</table></div>
+<div class="section"><h2>👥 All Users (${users.length})</h2><table><tr><th>Email</th><th>Plan</th><th>Usage</th><th>Token</th><th>Expires</th><th>Action</th></tr>${users.map(u=>`<tr><td>${esc(u.email)}</td><td><span class="badge badge-${esc(u.plan)}">${esc(u.planName)}</span></td><td><span style="font-size:12px;color:#5f6368">${u.used}/${u.limit}</span><div class="bar-bg"><div class="bar-fill" style="width:${Math.min(100,u.used/u.limit*100)}%"></div></div></td><td>${u.hasToken?'✅':'⚠️'}</td><td style="font-size:11px;color:#5f6368">${u.expiresAt?new Date(u.expiresAt).toLocaleDateString('en-IN'):'—'}</td><td><button class="btn btn-red" style="padding:4px 10px;font-size:11px" onclick="quickRevoke('${esc(u.email)}')">Revoke</button></td></tr>`).join('')}</table></div>
+<div class="section"><h2>📋 Recent Events</h2><table><tr><th>Time</th><th>Event</th><th>Email</th></tr>${rows.slice(0,50).map(r=>`<tr><td style="font-size:11px;color:#5f6368">${esc(r[0])}</td><td><span class="badge" style="${{EMAIL_OPENED:'background:#e8f5e9;color:#2e7d32',EMAIL_CLICKED:'background:#1b5e20;color:white',UNSUBSCRIBED:'background:#fce8e6;color:#d93025',EMAIL_BOUNCED:'background:#fff3e0;color:#e65100',EMAIL_SENT:'background:#f1f3f4;color:#5f6368'}[r[1]]||'background:#f1f3f4;color:#333'}">${esc(r[1])}</span></td><td>${esc(r[2])}</td></tr>`).join('')}</table></div>
 </div>
 <script>const KEY='${adminKey}';async function grantAccess(){const email=document.getElementById('grantEmail').value.trim();const plan=document.getElementById('grantPlan').value;const months=document.getElementById('grantMonths').value;if(!email)return showMsg('Enter email!',false);const r=await fetch('/admin/grant?key='+KEY,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email,plan,months:months?parseInt(months):null})});const d=await r.json();if(d.success){showMsg('✅ '+email+' → '+plan+' granted!',true);setTimeout(()=>location.reload(),1500);}else showMsg('❌ '+d.error,false);}async function revokeAccess(){const email=document.getElementById('grantEmail').value.trim();if(!email)return showMsg('Enter email!',false);const r=await fetch('/admin/revoke?key='+KEY,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email})});const d=await r.json();if(d.success){showMsg('✅ '+email+' revoked!',true);setTimeout(()=>location.reload(),1500);}else showMsg('❌ '+d.error,false);}async function quickRevoke(email){if(!confirm('Revoke '+email+'?'))return;await fetch('/admin/revoke?key='+KEY,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({email})});location.reload();}function showMsg(text,ok){const el=document.getElementById('grantMsg');el.textContent=text;el.className='msg '+(ok?'ok':'err');el.style.display='block';setTimeout(()=>el.style.display='none',3000);}</script></body></html>`);
   } catch(e) { res.status(500).send('Error: ' + e.message); }
@@ -973,9 +1116,19 @@ async function executeScheduledJob(job) {
       let subject = (draftSubject||'').replace(/\{\{(\w[\w\s]*)\}\}/g,(m,k)=>r[k.trim().toLowerCase()]||r[k.trim()]||m);
       html = wrapHtml(html);
       const enc      = encodeURIComponent(r.email);
+      // Per-recipient unguessable tracking id + signatures (match extension/server contract).
+      const tid    = crypto.randomBytes(16).toString('hex');
+      const sentAt = Date.now();
+      const sig    = hmacHex(`${tid}|${r.email}|${decodeURIComponent(camp)}`);
       const unsubUrl = `${serverUrl}/unsubscribe?email=${enc}&campaign=${camp}&sheetId=${sid}&tab=${stab}`;
-      html = html.replace('</body>',`<img src="${serverUrl}/track/open?email=${enc}&campaign=${camp}&sheetId=${sid}&tab=${stab}" width="1" height="1" style="display:none" alt=""/></body>`);
-      html = html.replace(/href="(https?:\/\/[^"]+)"/gi,(m,orig)=>orig.includes(serverUrl)?m:`href="${serverUrl}/track/click?email=${enc}&campaign=${camp}&sheetId=${sid}&tab=${stab}&url=${encodeURIComponent(orig)}"`);
+      html = html.replace('</body>',`<img src="${serverUrl}/track/open?tid=${tid}&sentAt=${sentAt}&sig=${sig}&email=${enc}&campaign=${camp}&sheetId=${sid}&tab=${stab}" width="1" height="1" style="display:none" alt=""/></body>`);
+      let _li = 0;
+      html = html.replace(/href="(https?:\/\/[^"]+)"/gi,(m,orig)=>{
+        if (orig.includes(serverUrl)) return m;
+        const dsig = hmacHex(`${tid}|${orig}`);
+        const li = _li++;
+        return `href="${serverUrl}/track/click?tid=${tid}&l=${li}&sentAt=${sentAt}&sig=${sig}&dsig=${dsig}&email=${enc}&campaign=${camp}&sheetId=${sid}&tab=${stab}&url=${encodeURIComponent(orig)}"`;
+      });
       html = html.replace('</body>',`<div style="margin-top:28px;padding-top:14px;border-top:1px solid #e8eaed;text-align:center;font-family:Arial,sans-serif;font-size:11px;color:#9aa0a6;"><a href="${unsubUrl}" style="color:#9aa0a6;">Unsubscribe</a></div></body>`);
 
       const boundary = 'mm_' + Math.random().toString(36).slice(2);
