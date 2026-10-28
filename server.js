@@ -749,7 +749,8 @@ app.get('/track/open', async (req,res) => {
   //    → this is a stray/forged/legacy hit. Record NOTHING. This alone kills
   //    the "any GET marks opened" class of false positives.
   if (!tid || !sigValid(sig, `${tid}|${email}|${campaign||''}`)) {
-    console.log(`🚫 open: rejected (bad/missing tid|sig) email=${email}`);
+    const diag = `tid=${tid?('YES '+String(tid).slice(0,8)):'MISSING'} sig=${sig?'YES':'MISSING'} sigValid=${(tid&&sig)?sigValid(sig, `${tid}|${email}|${campaign||''}`):false} secretSet=${!!TRACKING_SECRET}`;
+    console.log(`🚫 open: rejected email=${email} | ${diag}`);
     return;
   }
 
@@ -793,7 +794,8 @@ app.get('/track/click', async (req,res) => {
 
   // 2) Require a validly-signed tracking id before recording anything.
   if (!sigValid(sig, `${tid}|${email}|${campaign||''}`) || !dsigOk) {
-    console.log(`🚫 click: rejected (bad/missing sig/dsig) email=${email}`);
+    const diag = `tid=${tid?('YES '+String(tid).slice(0,8)):'MISSING'} sig=${sig?'YES':'MISSING'} sigValid=${(tid&&sig)?sigValid(sig, `${tid}|${email}|${campaign||''}`):false} dsig=${dsig?'YES':'MISSING'} dsigOk=${!!dsigOk} secretSet=${!!TRACKING_SECRET}`;
+    console.log(`🚫 click: rejected email=${email} | ${diag}`);
     return;
   }
 
