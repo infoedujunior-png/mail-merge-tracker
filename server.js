@@ -55,10 +55,16 @@ function sigValid(received, message) {
 }
 // Decide if a tracking hit is a likely-human interaction vs automated.
 // automated = within the proxy window after sentAt, OR a known scanner UA.
+// NOTE on Gmail: a recipient's real open is fetched through Gmail's own image
+// proxy ("GoogleImageProxy"/"ggpht"), and Gmail caches it — so that proxy fetch
+// IS the human open signal. We therefore do NOT treat Gmail's proxy as a scanner
+// (otherwise Gmail opens would never count). Genuine link/security scanners
+// (SafeLinks, Mimecast, bots, CLI fetchers) are still flagged — they matter most
+// for clicks. The `sentAt` window still suppresses the instant send-time prefetch.
 function classifyHit(sentAtRaw, userAgent) {
   const sentAt = parseInt(sentAtRaw || '0', 10);
   const ua = (userAgent || '').toLowerCase();
-  const scanner = /googleimageproxy|ggpht|feedfetcher|bot|crawler|spider|scanner|proofpoint|mimecast|barracuda|symantec|forcepoint|microsoft office|safelinks|outlook-iosandroid|preview|monitoring|curl|wget|python-requests|go-http|java\//.test(ua);
+  const scanner = /feedfetcher|crawler|spider|scanner|proofpoint|mimecast|barracuda|symantec|forcepoint|safelinks|microsoft office|outlook-iosandroid|curl|wget|python-requests|go-http|java\/|headless|phantomjs/.test(ua);
   const withinProxyWindow = sentAt > 0 && (Date.now() - sentAt) < PROXY_WINDOW_MS;
   return { automated: scanner || withinProxyWindow, scanner, withinProxyWindow };
 }
